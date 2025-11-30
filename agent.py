@@ -323,18 +323,110 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """
+    Member A (架构师) & Member B (物理学家) 的合作结晶
+    """
     
     def __init__(self):
-        pass
-    
-    def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
-        
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
+        super().__init__()
+        # 可以在这里初始化一些策略参数
+        self.num_simulation = 50 # 蒙特卡洛模拟次数 (Member A 负责策略配置)
+
+    def decision(self, balls, my_targets, table):
         """
-        return self._random_action()
+        Member A 负责的主决策逻辑：
+        1. 遍历所有“目标球-袋口”组合
+        2. 调用 Member B 的几何解算器 (solve_shot_parameters)
+        3. 调用 Member B 的路径检测器 (is_path_clear)
+        4. (未来) 调用 Member A 的评分系统进行优选
+        """
+        
+        # 1. 获取合法的目标球
+        legal_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
+        if not legal_targets:
+            # 如果目标球全进了，就打黑8
+            legal_targets = ['8']
+            
+        cue_ball = balls['cue']
+        pockets = table.pockets
+        
+        candidates = [] # 候选击球动作列表
+
+        print(f"[NewAgent] 正在思考... 剩余目标球: {legal_targets}")
+
+        # 2. 遍历所有可能性
+        for target_id in legal_targets:
+            target_ball = balls[target_id]
+            
+            for pocket_id, pocket in pockets.items():
+                # --- [Member B 工作区] 几何解算 ---
+                # 计算把 target_ball 打进 pocket 所需的击球参数
+                action = self.solve_shot_parameters(cue_ball, target_ball, pocket)
+                
+                if action is None:
+                    continue # 物理上打不进（比如角度太死）
+                
+                # --- [Member B 工作区] 路径检测 ---
+                # 检查路线上有没有障碍球
+                if not self.is_path_clear(cue_ball, target_ball, pocket, balls):
+                    continue # 路线被挡住了
+                
+                # 如果通过了上述检查，这就是一个“候选动作”
+                candidates.append(action)
+
+        # 3. 决策 (Member A 的策略核心)
+        if not candidates:
+            print("[NewAgent] 没有发现必进球，执行防守或随机击球。")
+            return self._random_action()
+        
+        # 目前阶段：简单返回第一个找到的可行解
+        # 下一阶段：在这里加入蒙特卡洛模拟 (simulate_shot) 和走位评分
+        print(f"[NewAgent] 发现 {len(candidates)} 个可行解，选择第一个执行。")
+        return candidates[0]
+
+    def solve_shot_parameters(self, cue_ball, target_ball, pocket):
+        """
+        [待 Member B 实现] 几何求解器
+        
+        功能：
+            计算将 target_ball 打进 pocket 所需的白球击球参数 (V0, phi, theta)。
+            需要计算“幻影球”位置，并反推白球的击球角度。
+            
+        参数：
+            cue_ball: 白球对象
+            target_ball: 目标球对象
+            pocket: 目标袋口对象
+            
+        返回：
+            dict: {'V0': float, 'phi': float, 'theta': float, 'a': 0, 'b': 0}
+            如果物理上无法打进（例如切球角度 > 90度），返回 None
+        """
+        # TODO: Member B 请在此处实现几何计算逻辑
+        # 提示：
+        # 1. 计算 pocket center 和 target center 的向量
+        # 2. 计算 ghost ball 位置 (target center 沿向量反向延伸 2*R)
+        # 3. 计算 cue ball 到 ghost ball 的角度 phi
+        return None 
+
+    def is_path_clear(self, cue_ball, target_ball, pocket, balls):
+        """
+        [待 Member B 实现] 路径检测器
+        
+        功能：
+            检查两个路径段是否被其他球阻挡：
+            1. 白球 -> 幻影球 (Ghost Ball)
+            2. 目标球 -> 袋口 (Pocket)
+            
+        参数：
+            cue_ball: 白球对象
+            target_ball: 目标球对象
+            pocket: 目标袋口对象
+            balls: 所有球的状态字典 (用于检查障碍物)
+            
+        返回：
+            bool: True 表示路径通畅，False 表示有阻挡
+        """
+        # TODO: Member B 请在此处实现碰撞检测逻辑
+        # 提示：
+        # 计算线段到点的距离，如果距离 < 2*R，则认为会发生碰撞
+        return True
