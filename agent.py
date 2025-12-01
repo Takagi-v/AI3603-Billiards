@@ -401,12 +401,99 @@ class NewAgent(Agent):
             dict: {'V0': float, 'phi': float, 'theta': float, 'a': 0, 'b': 0}
             如果物理上无法打进（例如切球角度 > 90度），返回 None
         """
-        # TODO: Member B 请在此处实现几何计算逻辑
-        # 提示：
-        # 1. 计算 pocket center 和 target center 的向量
-        # 2. 计算 ghost ball 位置 (target center 沿向量反向延伸 2*R)
-        # 3. 计算 cue ball 到 ghost ball 的角度 phi
-        return None 
+        # 1. 获取位置信息 (x, y 坐标)
+        cue_pos = cue_ball.state.rvw[0]
+        target_pos = target_ball.state.rvw[0]
+        pocket_pos = pocket.center
+        
+        # 2. 获取球半径 (从球对象参数中获取)
+        R = cue_ball.params.R
+
+        # 3. 计算 target 到 pocket 的向量 (击球线)
+        # 我们只关心水平面上的向量 (x, y)
+        target_to_pocket = pocket_pos - target_pos
+        # 忽略 z 轴差异 (虽然通常 z 是一样的)
+        target_to_pocket[2] = 0 
+        
+        dist_target_pocket = np.linalg.norm(target_to_pocket)
+        if dist_target_pocket < 1e-6:
+            return None # 已经在袋口了?
+            
+        # 单位向量
+        u_tp = target_to_pocket / dist_target_pocket
+        
+        # 4. 计算 Ghost Ball 位置
+        # Ghost Ball 是白球击中目标球瞬间，白球中心应该所在的位置
+        # 它位于目标球中心沿 target_to_pocket 反方向延伸 2R 处
+        ghost_pos = target_pos - u_tp * (2 * R)
+        
+        # 5. 计算白球到 Ghost Ball 的向量 (瞄准线)
+        cue_to_ghost = ghost_pos - cue_pos
+        cue_to_ghost[2] = 0
+        
+        dist_cue_ghost = np.linalg.norm(cue_to_ghost)
+        if dist_cue_ghost < 1e-6:
+            # 白球就在 Ghost Ball 位置，直接打? 这种情况极少
+            # 简单的处理：沿 u_tp 方向打
+            phi = np.degrees(np.arctan2(u_tp[1], u_tp[0]))
+        else:
+            u_cg = cue_to_ghost / dist_cue_ghost
+            
+            # 6. 检查切球角度 (Cut Angle)
+            # 向量 cue_to_target
+            cue_to_target = target_pos - cue_pos
+            cue_to_target[2] = 0
+            
+            # 如果 cue_to_target 和 target_to_pocket 的夹角超过 90 度，则无法直接打进
+            # 判断方法：点积
+            # 注意：这里要判断的是 "白球 -> 目标球" 方向 与 "目标球 -> 袋口" 方向的夹角
+            # 如果这个夹角 > 90度，说明目标球在白球和袋口之间，可以打
+            # 如果夹角 < 90度?? 
+            # 正确的物理限制：
+            # 切球角度是 u_cg (白球行进方向) 和 u_tp (目标球行进方向) 之间的夹角
+            # 只要这个角度 < 90 度，理论上就能让目标球沿 u_tp 运动 (只要摩擦力允许)
+            # 但如果 Ghost Ball 被 Target Ball 挡住了（即 Ghost Ball 在 Target Ball "后面"），那就打不到 Ghost Ball
+            
+            # 让我们用更直观的判断：
+            # 向量 cue_to_target (v_ct) 与 u_tp 的点积
+            # 如果 v_ct · u_tp > 0，说明白球大致在目标球的“后方”，可以向前击打目标球入袋
+            # 如果 v_ct · u_tp < 0，说明白球在目标球的“前方”，需要回打(不可能)
+            
+            # 更精确的判断：检查 Ghost Ball 是否可达
+            # Ghost Ball 必须对白球可见，且不能与 Target Ball 重叠（当然不会，它是虚拟的）
+            # 关键是：白球去 Ghost Ball 的路径上，不能先碰到 Target Ball
+            # 这意味着：cue_to_ghost 方向上，Target Ball 不能在中间
+            # 但实际上，Ghost Ball 就紧贴着 Target Ball。
+            # 只要 angle(cue_to_ghost, u_tp) < 90度，就可以。
+            # 实际上是 angle(u_cg, u_tp)
+            
+            dot_prod = np.dot(u_cg, u_tp)
+            # 限制在 -1 到 1 之间以防浮点误差
+            dot_prod = np.clip(dot_prod, -1.0, 1.0)
+            cut_angle = np.degrees(np.arccos(dot_prod))
+            
+            if cut_angle > 80: # 留一点余量，超过80度很难打
+                return None
+            
+            phi = np.degrees(np.arctan2(u_cg[1], u_cg[0]))
+
+        # 规范化 phi 到 [0, 360)
+        phi = phi % 360
+        
+        # 7. 设定其他参数
+        # 简单的力度策略：距离越远力度越大
+        # 基础力度 1.5，每米增加 1.0
+        # 总距离 = 白球到Ghost + Ghost到袋口 (近似 Target到袋口)
+        total_dist = dist_cue_ghost + dist_target_pocket
+        V0 = 1.5 + total_dist * 1.5
+        V0 = np.clip(V0, 0.5, 8.0) # 限制在允许范围内
+        
+        # theta, a, b 设为默认值
+        theta = 0.0 # 平击
+        a = 0.0
+        b = 0.0
+        
+        return {'V0': V0, 'phi': phi, 'theta': theta, 'a': a, 'b': b}
 
     def is_path_clear(self, cue_ball, target_ball, pocket, balls):
         """
@@ -426,7 +513,66 @@ class NewAgent(Agent):
         返回：
             bool: True 表示路径通畅，False 表示有阻挡
         """
-        # TODO: Member B 请在此处实现碰撞检测逻辑
-        # 提示：
-        # 计算线段到点的距离，如果距离 < 2*R，则认为会发生碰撞
+        R = cue_ball.params.R
+        
+        # 关键点坐标
+        cue_pos = cue_ball.state.rvw[0]
+        target_pos = target_ball.state.rvw[0]
+        pocket_pos = pocket.center
+        
+        # 计算 Ghost Ball 位置
+        target_to_pocket = pocket_pos - target_pos
+        target_to_pocket[2] = 0
+        dist_tp = np.linalg.norm(target_to_pocket)
+        if dist_tp < 1e-6: return True # 应该不会发生
+        u_tp = target_to_pocket / dist_tp
+        ghost_pos = target_pos - u_tp * (2 * R)
+        
+        # 定义线段点距离函数
+        def point_line_segment_distance(px, py, x1, y1, x2, y2):
+            # 计算点 (px, py) 到线段 (x1, y1)-(x2, y2) 的最短距离
+            # 向量 AB
+            dx = x2 - x1
+            dy = y2 - y1
+            if dx == 0 and dy == 0:
+                return math.sqrt((px - x1)**2 + (py - y1)**2)
+
+            # 投影参数 t
+            t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
+            
+            # 限制 t 在 [0, 1]
+            t = max(0, min(1, t))
+            
+            # 最近点
+            closest_x = x1 + t * dx
+            closest_y = y1 + t * dy
+            
+            return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+
+        # 检查所有球
+        for ball_id, ball in balls.items():
+            if ball.state.s == 4: # 已进袋的球忽略
+                continue
+            if ball_id == cue_ball.id or ball_id == target_ball.id:
+                continue
+            
+            pos = ball.state.rvw[0]
+            bx, by = pos[0], pos[1]
+            
+            # 1. 检查路径: 白球 -> Ghost Ball
+            # 起点: cue_pos, 终点: ghost_pos
+            # 注意：这里的终点是 ghost_pos。Ghost Ball 本身与 Target Ball 相切。
+            # 我们的检测应该稍微避开 Target Ball，否则会误报 Target Ball 阻挡
+            # 但这里 loop 中已经排除了 target_ball，所以可以直接测
+            
+            dist1 = point_line_segment_distance(bx, by, cue_pos[0], cue_pos[1], ghost_pos[0], ghost_pos[1])
+            if dist1 < 2 * R: # 障碍球中心到路径距离小于 2R，说明会碰撞
+                return False
+                
+            # 2. 检查路径: 目标球 -> 袋口
+            # 起点: target_pos, 终点: pocket_pos
+            dist2 = point_line_segment_distance(bx, by, target_pos[0], target_pos[1], pocket_pos[0], pocket_pos[1])
+            if dist2 < 2 * R:
+                return False
+                
         return True
