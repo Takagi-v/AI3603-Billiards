@@ -329,8 +329,11 @@ class NewAgent(Agent):
     
     def __init__(self):
         super().__init__()
-        # 可以在这里初始化一些策略参数
-        self.num_simulation = 50 # 蒙特卡洛模拟次数 (Member A 负责策略配置)
+        self.num_simulation = 20 # 蒙特卡洛模拟次数 (降低一点以保证速度)
+        # 继承环境的噪声设置用于模拟
+        self.noise_std = {
+            'V0': 0.1, 'phi': 0.1, 'theta': 0.1, 'a': 0.003, 'b': 0.003
+        }
 
     def decision(self, balls, my_targets, table):
         """
@@ -338,19 +341,21 @@ class NewAgent(Agent):
         1. 遍历所有“目标球-袋口”组合
         2. 调用 Member B 的几何解算器 (solve_shot_parameters)
         3. 调用 Member B 的路径检测器 (is_path_clear)
-        4. (未来) 调用 Member A 的评分系统进行优选
+        4. [NEW] 调用 Member A 的蒙特卡洛模拟 (simulate_shot) 进行评分
         """
         
         # 1. 获取合法的目标球
         legal_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
         if not legal_targets:
-            # 如果目标球全进了，就打黑8
             legal_targets = ['8']
             
         cue_ball = balls['cue']
         pockets = table.pockets
         
-        candidates = [] # 候选击球动作列表
+        best_action = None
+        best_score = -float('inf')
+        
+        candidates_count = 0
 
         print(f"[NewAgent] 正在思考... 剩余目标球: {legal_targets}")
 
@@ -359,220 +364,252 @@ class NewAgent(Agent):
             target_ball = balls[target_id]
             
             for pocket_id, pocket in pockets.items():
-                # --- [Member B 工作区] 几何解算 ---
-                # 计算把 target_ball 打进 pocket 所需的击球参数
+                # --- [Member B] 几何解算 ---
                 action = self.solve_shot_parameters(cue_ball, target_ball, pocket)
+                if action is None: continue 
                 
-                if action is None:
-                    continue # 物理上打不进（比如角度太死）
-                
-                # --- [Member B 工作区] 路径检测 ---
-                # 检查路线上有没有障碍球
+                # --- [Member B] 路径检测 ---
                 if not self.is_path_clear(cue_ball, target_ball, pocket, balls):
-                    continue # 路线被挡住了
+                    continue 
                 
-                # 如果通过了上述检查，这就是一个“候选动作”
-                candidates.append(action)
+                candidates_count += 1
+                
+                # --- [Member A] 蒙特卡洛模拟与评分 ---
+                base_v0 = action['V0']
+                base_phi = action['phi']
+                
+                # [改进] 增加角度微调，对抗物理误差（如Throw效应）
+                v0_choices = [base_v0 * 0.9, base_v0]
+                phi_choices = [base_phi - 0.5, base_phi, base_phi + 0.5]
+                
+                for v0 in v0_choices:
+                    if v0 < 0.5 or v0 > 8.0: continue
+                    for phi in phi_choices:
+                        test_action = action.copy()
+                        test_action['V0'] = v0
+                        test_action['phi'] = phi
+                        
+                        # 模拟 N 次
+                        success_rate, avg_score = self.simulate_shot(test_action, balls, table, target_id, my_targets)
+                        
+                        # 评分公式
+                        final_score = success_rate * 100 + avg_score * 0.5
+                        if success_rate < 0.3:
+                            final_score -= 50
+                        
+                        # Debug: 如果发现一个还不错的球，打印一下
+                        if success_rate > 0.2:
+                            print(f"  > 候选: Target={target_id}, Pocket={pocket_id}, V0={v0:.1f}, phi={phi:.1f}, WinRate={success_rate:.2f}, Score={final_score:.1f}")
+                        
+                        if final_score > best_score:
+                            best_score = final_score
+                            best_action = test_action
 
-        # 3. 决策 (Member A 的策略核心)
-        if not candidates:
-            print("[NewAgent] 没有发现必进球，执行防守或随机击球。")
+        # 3. 决策
+        if best_action is None:
+            print("[NewAgent] 没有发现可靠的进攻机会，执行随机防守。")
             return self._random_action()
         
-        # 目前阶段：简单返回第一个找到的可行解
-        # 下一阶段：在这里加入蒙特卡洛模拟 (simulate_shot) 和走位评分
-        print(f"[NewAgent] 发现 {len(candidates)} 个可行解，选择第一个执行。")
-        return candidates[0]
+        print(f"[NewAgent] 评估了 {candidates_count} 个球路，选择最佳方案 (得分: {best_score:.1f})")
+        return best_action
+
+    def simulate_shot(self, action, balls, table, target_id, my_targets):
+        """
+        [Member A 实现] 蒙特卡洛模拟
+        
+        在脑海中模拟多次击球，返回成功率和平均得分。
+        [升级] 加入了对白球洗袋和未碰库犯规的检测与惩罚。
+        """
+        success_count = 0
+        total_score = 0
+        
+        # 创建模拟环境的基础对象
+        sim_table = copy.deepcopy(table)
+        cue = pt.Cue(cue_ball_id="cue")
+        
+        for _ in range(self.num_simulation):
+            # 1. 复制当前球状态
+            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            
+            # 2. 添加噪声
+            noisy_action = {
+                'V0': np.clip(action['V0'] + np.random.normal(0, self.noise_std['V0']), 0.5, 8.0),
+                'phi': (action['phi'] + np.random.normal(0, self.noise_std['phi'])) % 360,
+                'theta': np.clip(action['theta'] + np.random.normal(0, self.noise_std['theta']), 0, 90),
+                'a': np.clip(action['a'] + np.random.normal(0, self.noise_std['a']), -0.5, 0.5),
+                'b': np.clip(action['b'] + np.random.normal(0, self.noise_std['b']), -0.5, 0.5)
+            }
+            
+            # 3. 物理模拟
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            shot.cue.set_state(**noisy_action)
+            pt.simulate(shot, inplace=True)
+            
+            # 4. 分析结果
+            new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and sim_balls[bid].state.s != 4]
+            cue_pocketed = 'cue' in new_pocketed
+            eight_pocketed = '8' in new_pocketed
+            
+            # 分析碰撞事件 (检测碰库)
+            cue_hit_cushion = False
+            target_hit_cushion = False
+            first_contact_ball_id = None
+            
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, 'ids') else []
+                
+                # 记录首球
+                if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                    other_ids = [i for i in ids if i != 'cue']
+                    if other_ids and first_contact_ball_id is None:
+                        first_contact_ball_id = other_ids[0]
+                
+                # 记录碰库
+                if 'cushion' in et:
+                    if 'cue' in ids: cue_hit_cushion = True
+                    if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                        target_hit_cushion = True
+
+            # 5. 评分逻辑
+            is_success = False
+            
+            # 判定进球成功
+            if target_id in new_pocketed:
+                if not cue_pocketed:
+                    if not eight_pocketed or target_id == '8':
+                        is_success = True
+            
+            if is_success:
+                success_count += 1
+                # 基础分 +100
+                shot_score = 100
+                
+                # 走位评分：白球离中心越近越好（避免贴库）
+                cue_pos = sim_balls['cue'].state.rvw[0]
+                dist_to_center = np.linalg.norm(cue_pos[:2] - np.array([table.w/2, table.l/2]))
+                shot_score += (1.0 - dist_to_center) * 10 # 走位分权重
+                
+                total_score += shot_score
+            else:
+                # 失败惩罚
+                if cue_pocketed:
+                    total_score -= 500 # 白球洗袋：重罚
+                elif eight_pocketed and target_id != '8':
+                    total_score -= 1000 # 误打黑8：直接判负，极刑
+                else:
+                    # 没进球，检查是否犯规
+                    foul = False
+                    
+                    # 1. 空杆犯规
+                    if first_contact_ball_id is None:
+                        foul = True
+                    
+                    # 2. 未碰库犯规 (如果没进球，且白球和目标球都没碰库)
+                    if not new_pocketed and not (cue_hit_cushion or target_hit_cushion):
+                        foul = True
+                        
+                    if foul:
+                        total_score -= 50 # 犯规惩罚
+                    else:
+                        total_score += 0 # 正常防守/失误，不扣分也不得分
+                
+        success_rate = success_count / self.num_simulation
+        avg_score = total_score / self.num_simulation if self.num_simulation > 0 else 0
+        
+        return success_rate, avg_score
 
     def solve_shot_parameters(self, cue_ball, target_ball, pocket):
         """
-        [待 Member B 实现] 几何求解器
-        
-        功能：
-            计算将 target_ball 打进 pocket 所需的白球击球参数 (V0, phi, theta)。
-            需要计算“幻影球”位置，并反推白球的击球角度。
-            
-        参数：
-            cue_ball: 白球对象
-            target_ball: 目标球对象
-            pocket: 目标袋口对象
-            
-        返回：
-            dict: {'V0': float, 'phi': float, 'theta': float, 'a': 0, 'b': 0}
-            如果物理上无法打进（例如切球角度 > 90度），返回 None
+        [Member B 实现] 几何求解器
         """
         # 1. 获取位置信息 (x, y 坐标)
         cue_pos = cue_ball.state.rvw[0]
         target_pos = target_ball.state.rvw[0]
         pocket_pos = pocket.center
         
-        # 2. 获取球半径 (从球对象参数中获取)
+        # 2. 获取球半径
         R = cue_ball.params.R
 
-        # 3. 计算 target 到 pocket 的向量 (击球线)
-        # 我们只关心水平面上的向量 (x, y)
+        # 3. 计算 target 到 pocket 的向量
         target_to_pocket = pocket_pos - target_pos
-        # 忽略 z 轴差异 (虽然通常 z 是一样的)
         target_to_pocket[2] = 0 
         
         dist_target_pocket = np.linalg.norm(target_to_pocket)
         if dist_target_pocket < 1e-6:
-            return None # 已经在袋口了?
+            return None 
             
-        # 单位向量
         u_tp = target_to_pocket / dist_target_pocket
         
         # 4. 计算 Ghost Ball 位置
-        # Ghost Ball 是白球击中目标球瞬间，白球中心应该所在的位置
-        # 它位于目标球中心沿 target_to_pocket 反方向延伸 2R 处
         ghost_pos = target_pos - u_tp * (2 * R)
         
-        # 5. 计算白球到 Ghost Ball 的向量 (瞄准线)
+        # 5. 计算白球到 Ghost Ball 的向量
         cue_to_ghost = ghost_pos - cue_pos
         cue_to_ghost[2] = 0
         
         dist_cue_ghost = np.linalg.norm(cue_to_ghost)
         if dist_cue_ghost < 1e-6:
-            # 白球就在 Ghost Ball 位置，直接打? 这种情况极少
-            # 简单的处理：沿 u_tp 方向打
             phi = np.degrees(np.arctan2(u_tp[1], u_tp[0]))
         else:
             u_cg = cue_to_ghost / dist_cue_ghost
             
-            # 6. 检查切球角度 (Cut Angle)
-            # 向量 cue_to_target
-            cue_to_target = target_pos - cue_pos
-            cue_to_target[2] = 0
-            
-            # 如果 cue_to_target 和 target_to_pocket 的夹角超过 90 度，则无法直接打进
-            # 判断方法：点积
-            # 注意：这里要判断的是 "白球 -> 目标球" 方向 与 "目标球 -> 袋口" 方向的夹角
-            # 如果这个夹角 > 90度，说明目标球在白球和袋口之间，可以打
-            # 如果夹角 < 90度?? 
-            # 正确的物理限制：
-            # 切球角度是 u_cg (白球行进方向) 和 u_tp (目标球行进方向) 之间的夹角
-            # 只要这个角度 < 90 度，理论上就能让目标球沿 u_tp 运动 (只要摩擦力允许)
-            # 但如果 Ghost Ball 被 Target Ball 挡住了（即 Ghost Ball 在 Target Ball "后面"），那就打不到 Ghost Ball
-            
-            # 让我们用更直观的判断：
-            # 向量 cue_to_target (v_ct) 与 u_tp 的点积
-            # 如果 v_ct · u_tp > 0，说明白球大致在目标球的“后方”，可以向前击打目标球入袋
-            # 如果 v_ct · u_tp < 0，说明白球在目标球的“前方”，需要回打(不可能)
-            
-            # 更精确的判断：检查 Ghost Ball 是否可达
-            # Ghost Ball 必须对白球可见，且不能与 Target Ball 重叠（当然不会，它是虚拟的）
-            # 关键是：白球去 Ghost Ball 的路径上，不能先碰到 Target Ball
-            # 这意味着：cue_to_ghost 方向上，Target Ball 不能在中间
-            # 但实际上，Ghost Ball 就紧贴着 Target Ball。
-            # 只要 angle(cue_to_ghost, u_tp) < 90度，就可以。
-            # 实际上是 angle(u_cg, u_tp)
-            
+            # 6. 检查切球角度
             dot_prod = np.dot(u_cg, u_tp)
-            # 限制在 -1 到 1 之间以防浮点误差
             dot_prod = np.clip(dot_prod, -1.0, 1.0)
             cut_angle = np.degrees(np.arccos(dot_prod))
             
-            if cut_angle > 80: # 留一点余量，超过80度很难打
+            if cut_angle > 80: 
                 return None
             
             phi = np.degrees(np.arctan2(u_cg[1], u_cg[0]))
 
-        # 规范化 phi 到 [0, 360)
         phi = phi % 360
         
-        # 7. 设定其他参数
-        # 简单的力度策略：距离越远力度越大
-        # 基础力度 1.5，每米增加 1.0
-        # 总距离 = 白球到Ghost + Ghost到袋口 (近似 Target到袋口)
+        # 7. 设定参数
         total_dist = dist_cue_ghost + dist_target_pocket
         V0 = 1.5 + total_dist * 1.5
-        V0 = np.clip(V0, 0.5, 8.0) # 限制在允许范围内
+        V0 = np.clip(V0, 0.5, 8.0)
         
-        # theta, a, b 设为默认值
-        theta = 0.0 # 平击
-        a = 0.0
-        b = 0.0
-        
-        return {'V0': V0, 'phi': phi, 'theta': theta, 'a': a, 'b': b}
+        return {'V0': V0, 'phi': phi, 'theta': 0.0, 'a': 0.0, 'b': 0.0}
 
     def is_path_clear(self, cue_ball, target_ball, pocket, balls):
         """
-        [待 Member B 实现] 路径检测器
-        
-        功能：
-            检查两个路径段是否被其他球阻挡：
-            1. 白球 -> 幻影球 (Ghost Ball)
-            2. 目标球 -> 袋口 (Pocket)
-            
-        参数：
-            cue_ball: 白球对象
-            target_ball: 目标球对象
-            pocket: 目标袋口对象
-            balls: 所有球的状态字典 (用于检查障碍物)
-            
-        返回：
-            bool: True 表示路径通畅，False 表示有阻挡
+        [Member B 实现] 路径检测器
         """
         R = cue_ball.params.R
-        
-        # 关键点坐标
         cue_pos = cue_ball.state.rvw[0]
         target_pos = target_ball.state.rvw[0]
         pocket_pos = pocket.center
         
-        # 计算 Ghost Ball 位置
         target_to_pocket = pocket_pos - target_pos
         target_to_pocket[2] = 0
         dist_tp = np.linalg.norm(target_to_pocket)
-        if dist_tp < 1e-6: return True # 应该不会发生
+        if dist_tp < 1e-6: return True
         u_tp = target_to_pocket / dist_tp
         ghost_pos = target_pos - u_tp * (2 * R)
         
-        # 定义线段点距离函数
         def point_line_segment_distance(px, py, x1, y1, x2, y2):
-            # 计算点 (px, py) 到线段 (x1, y1)-(x2, y2) 的最短距离
-            # 向量 AB
             dx = x2 - x1
             dy = y2 - y1
             if dx == 0 and dy == 0:
                 return math.sqrt((px - x1)**2 + (py - y1)**2)
-
-            # 投影参数 t
             t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
-            
-            # 限制 t 在 [0, 1]
             t = max(0, min(1, t))
-            
-            # 最近点
             closest_x = x1 + t * dx
             closest_y = y1 + t * dy
-            
             return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
 
-        # 检查所有球
         for ball_id, ball in balls.items():
-            if ball.state.s == 4: # 已进袋的球忽略
-                continue
-            if ball_id == cue_ball.id or ball_id == target_ball.id:
-                continue
+            if ball.state.s == 4: continue
+            if ball_id == cue_ball.id or ball_id == target_ball.id: continue
             
             pos = ball.state.rvw[0]
             bx, by = pos[0], pos[1]
             
-            # 1. 检查路径: 白球 -> Ghost Ball
-            # 起点: cue_pos, 终点: ghost_pos
-            # 注意：这里的终点是 ghost_pos。Ghost Ball 本身与 Target Ball 相切。
-            # 我们的检测应该稍微避开 Target Ball，否则会误报 Target Ball 阻挡
-            # 但这里 loop 中已经排除了 target_ball，所以可以直接测
-            
-            dist1 = point_line_segment_distance(bx, by, cue_pos[0], cue_pos[1], ghost_pos[0], ghost_pos[1])
-            if dist1 < 2 * R: # 障碍球中心到路径距离小于 2R，说明会碰撞
+            if point_line_segment_distance(bx, by, cue_pos[0], cue_pos[1], ghost_pos[0], ghost_pos[1]) < 2 * R:
                 return False
-                
-            # 2. 检查路径: 目标球 -> 袋口
-            # 起点: target_pos, 终点: pocket_pos
-            dist2 = point_line_segment_distance(bx, by, target_pos[0], target_pos[1], pocket_pos[0], pocket_pos[1])
-            if dist2 < 2 * R:
+            if point_line_segment_distance(bx, by, target_pos[0], target_pos[1], pocket_pos[0], pocket_pos[1]) < 2 * R:
                 return False
                 
         return True
