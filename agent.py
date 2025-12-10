@@ -322,6 +322,17 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
+class VirtualState:
+    def __init__(self, pos):
+        self.rvw = np.array([np.array(pos), np.zeros(3), np.zeros(3)])
+        self.s = 1
+
+class VirtualBall:
+    def __init__(self, ball_id, pos, R=0.028575):
+        self.id = ball_id
+        self.state = VirtualState(pos)
+        self.params = type('Params', (), {'R': R})()
+
 class NewAgent(Agent):
     """
     Member A (架构师) & Member B (物理学家) 的合作结晶
@@ -535,6 +546,52 @@ class NewAgent(Agent):
         
         return success_rate, avg_score
 
+    @staticmethod
+    def get_mirror(point, rail):
+        p = point.copy()
+        p[rail['axis']] = 2 * rail['val'] - p[rail['axis']]
+        return p
+        
+    @staticmethod
+    def get_cushion_path(start_pos, end_pos, rail_sequence):
+        # 1. 从后往前生成镜像目标点
+        mirrored_targets = []
+        current_target = end_pos
+        for rail in reversed(rail_sequence):
+            current_target = NewAgent.get_mirror(current_target, rail)
+            mirrored_targets.append(current_target)
+        
+        # 2. 从前往后计算交点
+        targets_to_aim = mirrored_targets[::-1] # [First_Mirror, Second_Mirror, ..., End]
+        path_points = [start_pos]
+        current_p = start_pos
+        
+        for i, rail in enumerate(rail_sequence):
+            target_to_aim = targets_to_aim[i]
+            
+            vec = target_to_aim - current_p
+            vec[2] = 0
+            
+            if abs(vec[rail['axis']]) < 1e-6: return None
+            t = (rail['val'] - current_p[rail['axis']]) / vec[rail['axis']]
+            
+            if t <= 1e-4: return None # 必须向前
+            
+            p_intersect = current_p + t * vec
+            p_intersect[2] = 0
+            
+            # 检查交点是否在库边范围内
+            other_axis = 1 - rail['axis']
+            limit_min, limit_max = rail['limit']
+            if not (limit_min <= p_intersect[other_axis] <= limit_max):
+                return None
+                
+            path_points.append(p_intersect)
+            current_p = p_intersect
+        
+        path_points.append(end_pos)
+        return path_points
+
     def solve_shot_parameters(self, cue_ball, target_ball, pocket, balls=None, table=None):
         """
         [Member B 实现] 几何求解器 (重构版 - 严格物理校验)
@@ -595,54 +652,6 @@ class NewAgent(Agent):
                     return False
             return True
 
-        # 辅助函数：镜像点
-        def get_mirror(point, rail):
-            p = point.copy()
-            p[rail['axis']] = 2 * rail['val'] - p[rail['axis']]
-            return p
-            
-        # 辅助函数：计算多库路径点
-        # start_pos -> [rail_1, rail_2, ...] -> end_pos
-        # 返回: [start, p1, p2, ..., end] 或 None
-        def get_cushion_path(start_pos, end_pos, rail_sequence):
-            # 1. 从后往前生成镜像目标点
-            mirrored_targets = []
-            current_target = end_pos
-            for rail in reversed(rail_sequence):
-                current_target = get_mirror(current_target, rail)
-                mirrored_targets.append(current_target)
-            
-            # 2. 从前往后计算交点
-            targets_to_aim = mirrored_targets[::-1] # [First_Mirror, Second_Mirror, ..., End]
-            path_points = [start_pos]
-            current_p = start_pos
-            
-            for i, rail in enumerate(rail_sequence):
-                target_to_aim = targets_to_aim[i]
-                
-                vec = target_to_aim - current_p
-                vec[2] = 0
-                
-                if abs(vec[rail['axis']]) < 1e-6: return None
-                t = (rail['val'] - current_p[rail['axis']]) / vec[rail['axis']]
-                
-                if t <= 1e-4: return None # 必须向前
-                
-                p_intersect = current_p + t * vec
-                p_intersect[2] = 0
-                
-                # 检查交点是否在库边范围内
-                other_axis = 1 - rail['axis']
-                limit_min, limit_max = rail['limit']
-                if not (limit_min <= p_intersect[other_axis] <= limit_max):
-                    return None
-                    
-                path_points.append(p_intersect)
-                current_p = p_intersect
-            
-            path_points.append(end_pos)
-            return path_points
-
         # 辅助函数：尝试从 start_pos 击打到 end_pos (Ghost Ball)
         # 支持直球和踢球 (Kick)
         # 返回: list of dict {'method', 'phi', 'cushions', 'seq', 'u_arrival'}
@@ -666,7 +675,7 @@ class NewAgent(Agent):
                      })
 
             # 2. 踢球 (Kick Hit to Ghost)
-            max_kick_cushions = 1
+            max_kick_cushions = 2
             for n in range(1, max_kick_cushions + 1):
                 all_seqs = []
                 for seq in itertools.product(rails, repeat=n):
@@ -676,7 +685,7 @@ class NewAgent(Agent):
                     if valid: all_seqs.append(seq)
                 
                 for seq in all_seqs:
-                    path_points = get_cushion_path(start_pos, end_pos, seq)
+                    path_points = NewAgent.get_cushion_path(start_pos, end_pos, seq)
                     if path_points:
                         # 路径检查
                         path_clear = True
@@ -741,7 +750,7 @@ class NewAgent(Agent):
              })
              
         # A2. Target Bank
-        max_bank_cushions = 1
+        max_bank_cushions = 2
         for n in range(1, max_bank_cushions + 1):
             all_seqs = []
             for seq in itertools.product(rails, repeat=n):
@@ -751,7 +760,7 @@ class NewAgent(Agent):
                 if valid: all_seqs.append(seq)
             
             for seq in all_seqs:
-                path_points = get_cushion_path(target_pos, pocket_pos, seq)
+                path_points = NewAgent.get_cushion_path(target_pos, pocket_pos, seq)
                 if path_points:
                     path_clear = True
                     for i in range(len(path_points)-1):
@@ -816,48 +825,512 @@ class NewAgent(Agent):
                         'phi': cp['phi'],
                         'cushions': total_cushions,
                         'seq': combined_seq,
-                        'cut_angle': cut_angle
+                        'cue_seq': cp['seq'],
+                        'target_seq': strat['seq'],
+                        'cut_angle': cut_angle,
+                        'ghost': ghost,
+                        'u_arrival': cp['u_arrival'],
+                        'u_target_out': u_target_out
                     })
 
         return solutions
 
-    def is_path_clear(self, cue_ball, target_ball, pocket, balls):
+    def solve_runout_parameters(self, cue_ball, target_ball, next_target_ball, balls, table, opponent_targets=None):
         """
-        [Member B 实现] 路径检测器
+        [Member B] 进攻走位求解器 (Run-out Solver)
+        
+        功能：
+            在打进当前球(target_ball)的基础上，寻找最佳走位，以便进攻下一颗球(next_target_ball)。
+            如果无法进攻，则尝试防守 (调用 solve_defense_parameters)。
+            
+        参数：
+            cue_ball: 白球
+            target_ball: 当前目标球
+            next_target_ball: 下一颗目标球 (Ball对象) 或 None
+            balls: 所有球状态
+            table: 球桌对象
+            opponent_targets: 对手目标球ID列表 (用于防守计算)
+            
+        返回：
+            list: 包含评分的击球方案, 按推荐程度排序
         """
+        if balls is None or table is None: return []
+        
+        pockets = table.pockets
+        candidates = []
+        R = cue_ball.params.R
+        
+        # 1. 获取当前球的所有进球方案
+        for pocket_id, pocket in pockets.items():
+            shots = self.solve_shot_parameters(cue_ball, target_ball, pocket, balls, table)
+            for shot in shots:
+                shot['pocket_id'] = pocket_id
+                candidates.append(shot)
+        
+        # 2. 如果没有进球方案，转入防守模式
+        if not candidates:
+            # print("[Run-out] 无进攻机会，切换至防守模式...")
+            defense_solutions = self.solve_defense_parameters(cue_ball, target_ball, balls, table, opponent_targets)
+            # 统一格式返回
+            return defense_solutions
+            
+        # 3. 评估走位 (Run-out Logic)
+        scored_candidates = []
+        
+        for shot in candidates:
+            # --- 基础分：进球难度 ---
+            # 直球最稳，Kick/Bank 风险大
+            base_score = 100
+            if shot['type'] == 'Bank': base_score -= 30
+            elif 'Kick' in shot['type']: base_score -= 40
+            
+            # 切角过大容易失误
+            if shot['cut_angle'] > 60: base_score -= (shot['cut_angle'] - 60)
+            
+            # --- 走位分：为下一杆做准备 ---
+            position_score = 0
+            predicted_stop_pos = None
+            
+            if next_target_ball:
+                # 计算切线方向 (Tangent Line) - 假设定杆(Stun)
+                # u_out = u_arrival - (u_arrival . u_target_out) * u_target_out
+                u_arr = shot['u_arrival']
+                u_tgt = shot['u_target_out']
+                dot = np.dot(u_arr, u_tgt)
+                u_out_vec = u_arr - dot * u_tgt
+                
+                # 归一化分离方向
+                norm_out = np.linalg.norm(u_out_vec)
+                if norm_out < 1e-6:
+                    u_out = np.zeros(3) # 正面撞击，停在原地
+                else:
+                    u_out = u_out_vec / norm_out
+                
+                # 寻找切线上最佳停点
+                # 假设白球能在切线方向滚动 0.2m ~ 1.5m
+                # 我们采样几个点，看哪个点对 next_target 最好
+                best_spot_score = -float('inf')
+                best_spot = None
+                
+                ghost_pos = shot['ghost']
+                
+                # 采样距离: 0 (Stop), 0.3, 0.6, 0.9, 1.2 (Follow/Draw adjusted tangent)
+                # 注意：纯定杆只能沿切线。推杆/拉杆会偏离切线。
+                # 这里简化模型：只考虑切线上的点 (对于大角度切球，切线是主要分量)
+                
+                for dist in [0.0, 0.3, 0.6, 0.9, 1.2]:
+                    stop_pos = ghost_pos + u_out * dist
+                    
+                    # 检查是否出界
+                    if not (R < stop_pos[0] < table.w - R and R < stop_pos[1] < table.l - R):
+                        continue
+                    
+                    # [NEW] 模拟下一杆，计算可行解数量
+                    next_shot_count = 0
+                    if next_target_ball:
+                        sim_balls = balls.copy()
+                        sim_balls['cue'] = VirtualBall('cue', stop_pos, R)
+                        # 移除已打进的目标球
+                        if target_ball.id in sim_balls:
+                            del sim_balls[target_ball.id]
+                        
+                        if next_target_ball.id in sim_balls:
+                            sim_next_target = sim_balls[next_target_ball.id]
+                            for pid, pkt in pockets.items():
+                                 # 调用求解器计算下一杆的可行解
+                                 next_sols = self.solve_shot_parameters(sim_balls['cue'], sim_next_target, pkt, sim_balls, table)
+                                 next_shot_count += len(next_sols)
+                        
+                    # [NEW] 基于解数量的评分
+                    # 解越多，走位越好。
+                    simulation_score = next_shot_count * 5
+                    
+                    # A. 是否可见 (Clear Path) - 保留作为快速过滤
+                    next_pos = next_target_ball.state.rvw[0]
+                    
+                    # 关键修正：检查下一杆时，当前目标球(target_ball)已经被打进，所以应排除
+                    # 同时也要排除下一颗球(next_target_ball)自己，因为它在路径终点，会被视为障碍
+                    if not self.is_segment_clear_static(stop_pos, next_pos, balls, exclude_ids=[cue_ball.id, target_ball.id, next_target_ball.id]):
+                        spot_score = -100 # 被阻挡
+                    else:
+                        spot_score = simulation_score # 使用模拟分作为基础
+                        
+                        # B. 距离适中 (太远难打，太近不好运杆)
+                        d_next = np.linalg.norm(next_pos - stop_pos)
+                        if d_next < 0.3: spot_score -= 20 # 太近
+                        elif d_next > 1.5: spot_score -= (d_next - 1.5) * 10 # 太远
+                        else: spot_score += 20 # 舒适区
+                        
+                        # C. 进球角度 (Next Cut Angle) - 保留作为质量补充
+                        best_pocket_angle_score = -50
+                        for pid, pkt in pockets.items():
+                            # 检查 Next -> Pocket 是否通畅 (同样排除当前目标球)
+                            if self.is_segment_clear_static(next_pos, pkt.center, balls, exclude_ids=[cue_ball.id, next_target_ball.id, target_ball.id]):
+                                # 计算 Next Cut Angle
+                                vec_np = pkt.center - next_pos
+                                vec_np[2] = 0
+                                u_np = vec_np / np.linalg.norm(vec_np)
+                                
+                                vec_cn = next_pos - stop_pos
+                                vec_cn[2] = 0
+                                dist_cn = np.linalg.norm(vec_cn)
+                                if dist_cn > 1e-6:
+                                    u_cn = vec_cn / dist_cn
+                                    # Cut Angle
+                                    angle = np.degrees(np.arccos(np.clip(np.dot(u_cn, u_np), -1, 1)))
+                                    
+                                    # 理想角度：15~45度 (方便再次走位)，直球也可以但走位稍难
+                                    # 0~60度是可接受范围
+                                    if angle > 70: s = -50
+                                    elif angle > 50: s = 10
+                                    elif angle < 10: s = 30
+                                    else: s = 50 # 10-50度 最佳
+                                    
+                                    if s > best_pocket_angle_score:
+                                        best_pocket_angle_score = s
+                        
+                        spot_score += best_pocket_angle_score
+                    
+                    if spot_score > best_spot_score:
+                        best_spot_score = spot_score
+                        best_spot = stop_pos
+                
+                if best_spot is not None:
+                    position_score = best_spot_score
+                    predicted_stop_pos = best_spot
+                else:
+                    position_score = -50 # 无法停在好位置
+            else:
+                # 如果没有下一颗球，只求打进，且白球不洗袋
+                position_score = 0
+                predicted_stop_pos = shot['ghost'] # 粗略
+            
+            # 总分
+            shot['score'] = base_score + position_score
+            shot['predicted_stop_pos'] = predicted_stop_pos
+            scored_candidates.append(shot)
+            
+        # 排序
+        scored_candidates.sort(key=lambda x: x['score'], reverse=True)
+        return scored_candidates
+
+    def trace_ray_with_rebound(self, start_pos, direction_u, distance, table_w, table_l, R):
+        """
+        Simulate a rolling ball path with wall rebounds.
+        Returns:
+            final_pos (np.array): The stop position.
+            path_points (list of np.array): The list of vertices (start, bounce1, bounce2, ..., end).
+        """
+        pos = start_pos.copy()
+        u = direction_u.copy()
+        remaining_dist = distance
+        path = [pos.copy()]
+        
+        # Max rebounds to prevent infinite loops (though distance limits it naturally)
+        for _ in range(5):
+            if remaining_dist <= 1e-4: break
+            
+            # 1. Find collision time to each wall
+            # Walls: x=R, x=W-R, y=R, y=L-R
+            # To handle cushion compression or physics radius, we use R.
+            
+            t_min = float('inf')
+            wall_idx = -1 # 0:Left, 1:Right, 2:Bottom, 3:Top
+            
+            # Left (x=R)
+            if u[0] < -1e-6:
+                t = (R - pos[0]) / u[0]
+                if 0 <= t < t_min: t_min = t; wall_idx = 0
+            # Right (x=W-R)
+            elif u[0] > 1e-6:
+                t = (table_w - R - pos[0]) / u[0]
+                if 0 <= t < t_min: t_min = t; wall_idx = 1
+            
+            # Bottom (y=R)
+            if u[1] < -1e-6:
+                t = (R - pos[1]) / u[1]
+                if 0 <= t < t_min: t_min = t; wall_idx = 2
+            # Top (y=L-R)
+            elif u[1] > 1e-6:
+                t = (table_l - R - pos[1]) / u[1]
+                if 0 <= t < t_min: t_min = t; wall_idx = 3
+                
+            # Check if we stop before hitting wall
+            if remaining_dist <= t_min:
+                pos = pos + u * remaining_dist
+                path.append(pos.copy())
+                break
+            else:
+                # Hit wall
+                pos = pos + u * t_min
+                path.append(pos.copy())
+                remaining_dist -= t_min
+                
+                # Reflect
+                if wall_idx == 0 or wall_idx == 1: # Left/Right -> Reflect X
+                    u[0] = -u[0]
+                elif wall_idx == 2 or wall_idx == 3: # Top/Bottom -> Reflect Y
+                    u[1] = -u[1]
+                
+                # Energy loss on cushion? (Optional)
+                # remaining_dist *= 0.8
+        
+        return pos, path
+
+    def solve_defense_parameters(self, cue_ball, target_ball, balls, table, opponent_targets=None):
+        """
+        [Member B 实现] 防守求解器
+        
+        功能：
+            寻找防守击球方案，使白球停在安全位置（制造障碍或远台）。
+            
+        参数：
+            cue_ball: 白球对象
+            target_ball: 我方必须击打的球（合法目标）
+            balls: 所有球状态
+            table: 球桌对象
+            opponent_targets: 对手目标球ID列表 (用于评估Snooker效果)
+            
+        返回：
+            list: [{'phi': float, 'V0': float, 'type': 'Safety', 'score': float, 'strategy': str}]
+        """
+        if balls is None or table is None: return []
+        
+        solutions = []
         R = cue_ball.params.R
         cue_pos = cue_ball.state.rvw[0]
         target_pos = target_ball.state.rvw[0]
-        pocket_pos = pocket.center
         
-        target_to_pocket = pocket_pos - target_pos
-        target_to_pocket[2] = 0
-        dist_tp = np.linalg.norm(target_to_pocket)
-        if dist_tp < 1e-6: return True
-        u_tp = target_to_pocket / dist_tp
-        ghost_pos = target_pos - u_tp * (2 * R)
+        # 1. 尝试 Direct Hit 防守
+        direct_possible = self.is_path_clear(cue_ball, target_ball, None, balls)
         
-        def point_line_segment_distance(px, py, x1, y1, x2, y2):
-            dx = x2 - x1
-            dy = y2 - y1
-            if dx == 0 and dy == 0:
-                return math.sqrt((px - x1)**2 + (py - y1)**2)
-            t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
-            t = max(0, min(1, t))
-            closest_x = x1 + t * dx
-            closest_y = y1 + t * dy
-            return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+        if direct_possible:
+            vec_ct = target_pos - cue_pos
+            vec_ct[2] = 0
+            dist_ct = np.linalg.norm(vec_ct)
+            u_ct = vec_ct / dist_ct
+            angle_ct = np.degrees(np.arctan2(u_ct[1], u_ct[0]))
+            
+            # 搜索：不同的切角 和 不同的力度
+            # 切角
+            for cut_angle in range(-80, 81, 5): # 略微减小范围，避免85度过于极限
+                check_angle = angle_ct + 180 + cut_angle 
+                ghost_u = np.array([np.cos(np.radians(check_angle)), np.sin(np.radians(check_angle)), 0])
+                ghost_pos = target_pos + ghost_u * (2 * R)
+                
+                # Check if Ghost Position is physically valid (on table)
+                if not (R - 1e-4 <= ghost_pos[0] <= table.w - R + 1e-4 and 
+                        R - 1e-4 <= ghost_pos[1] <= table.l - R + 1e-4):
+                    continue
 
-        for ball_id, ball in balls.items():
+                # 检查白球能否直达该 Ghost
+                if not self.is_segment_clear_static(cue_pos, ghost_pos, balls, exclude_ids=[cue_ball.id, target_ball.id]):
+                    continue
+                
+                # 计算出射方向
+                vec_cg = ghost_pos - cue_pos
+                vec_cg[2] = 0
+                dist_cg = np.linalg.norm(vec_cg)
+                u_cg = vec_cg / dist_cg
+                phi = np.degrees(np.arctan2(u_cg[1], u_cg[0])) % 360
+                
+                u_n = -ghost_u
+                dot = np.dot(u_cg, u_n)
+                u_out_vec = u_cg - dot * u_n
+                norm_out = np.linalg.norm(u_out_vec)
+                u_out = u_out_vec / norm_out if norm_out > 1e-6 else np.zeros(3)
+                
+                # 力度搜索 (对应滚动距离)
+                # 假设我们可以控制白球撞击后滚动 0.5m, 1.0m, 1.5m, 2.0m, 2.5m, 3.0m
+                for roll_dist in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+                    pred_stop_pos, roll_path = self.trace_ray_with_rebound(ghost_pos, u_out, roll_dist, table.w, table.l, R)
+                    
+                    # [NEW] Check if roll path collides with any ball (Trajectory Validation)
+                    path_collision = False
+                    for i in range(len(roll_path) - 1):
+                        # Exclude cue (moving) and target (hit and moving away)
+                        if not self.is_segment_clear_static(roll_path[i], roll_path[i+1], balls, exclude_ids=[cue_ball.id, target_ball.id]):
+                            path_collision = True; break
+                    if path_collision: continue
+
+                    # 检查最终停点是否与其他球重叠 (Invalid position)
+                    valid_stop = True
+                    for bid, b in balls.items():
+                        if bid == 'cue': continue # Cue is moving
+                        if np.linalg.norm(pred_stop_pos - b.state.rvw[0]) < 2*R:
+                            valid_stop = False; break
+                    if not valid_stop: continue
+
+                    # Score
+                    score = 0
+                    if opponent_targets:
+                        min_dist = float('inf')
+                        for opp_id in opponent_targets:
+                            if opp_id in balls:
+                                d = np.linalg.norm(pred_stop_pos - balls[opp_id].state.rvw[0])
+                                if d < min_dist: min_dist = d
+                        score += min_dist * 10
+                        
+                        snookered = 0
+                        for opp_id in opponent_targets:
+                            if opp_id in balls:
+                                # 检查从 停点 到 对手目标球 是否被挡
+                                # 注意：要排除自己(因为是停点)和该对手球
+                                # 关键：检查谁在挡？可能是 Target Ball 刚被我们打跑了？
+                                # 这是一个动态问题。简化假设：Target Ball 被打远了，或者就在原地附近(如果是轻打)。
+                                # 如果是薄切，Target Ball 动得不多。
+                                # 这里我们还是用静态 balls 检查，但排除 target_ball (假设它不在阻挡线上，或者它就是阻挡者？)
+                                # 更好的做法：假设 Target Ball 移动了一段距离。
+                                # 简化：排除 target_ball，只看其他障碍物。
+                                if not self.is_segment_clear_static(pred_stop_pos, balls[opp_id].state.rvw[0], balls, exclude_ids=[opp_id, target_ball.id]):
+                                    snookered += 1
+                        score += snookered * 50
+                    
+                    # 贴库奖励
+                    dist_to_rail = min(pred_stop_pos[0]-R, table.w-R-pred_stop_pos[0], pred_stop_pos[1]-R, table.l-R-pred_stop_pos[1])
+                    if dist_to_rail < 1.5 * R: score += 30
+                    
+                    if score > 20:
+                        # V0 estimate: v^2 = 2*a*d. a approx 0.5? let's say V0 = sqrt(roll_dist * 2) + impact loss
+                        # Simplified V0 map
+                        v0_est = 1.0 + roll_dist * 0.8
+                        
+                        solutions.append({
+                            'type': 'Safety',
+                            'phi': phi,
+                            'V0': v0_est,
+                            'score': score,
+                            'strategy': 'Direct-Safety',
+                            'cut_angle': abs(cut_angle),
+                            'ghost': ghost_pos,
+                            'predicted_stop_pos': pred_stop_pos,
+                            'roll_dist': roll_dist,
+                            'roll_path': roll_path
+                        })
+
+        # 2. 增强版 Kick Safety (支持 1-2 库)
+        max_safety_cushions = 2
+        
+        import itertools 
+        
+        # Define rails locally
+        rails = [
+            {'name': 'left',   'val': 0,       'axis': 0, 'limit': (0, table.l)},
+            {'name': 'right',  'val': table.w, 'axis': 0, 'limit': (0, table.l)},
+            {'name': 'bottom', 'val': 0,       'axis': 1, 'limit': (0, table.w)},
+            {'name': 'top',    'val': table.l, 'axis': 1, 'limit': (0, table.w)}
+        ]
+        
+        for n in range(1, max_safety_cushions + 1):
+            all_seqs = []
+            for seq in itertools.product(rails, repeat=n):
+                valid = True
+                for i in range(len(seq)-1):
+                    if seq[i]['name'] == seq[i+1]['name']: valid = False; break
+                if valid: all_seqs.append(seq)
+            
+            for seq in all_seqs:
+                # Target is just a point we want to HIT.
+                # Use get_cushion_path
+                path_points = self.get_cushion_path(cue_pos, target_pos, seq)
+                if path_points:
+                    # Check clearance
+                    path_clear = True
+                    for i in range(len(path_points)-1):
+                        p1, p2 = path_points[i], path_points[i+1]
+                        # For safety, we just want to reach target ball.
+                        # Exclude target from obstacles (it's the goal).
+                        # Exclude cue from obstacles.
+                        # [Modified] Add safety margin to avoid visual overlap or physics edge cases
+                        if not self.is_segment_clear_static(p1, p2, balls, exclude_ids=[cue_ball.id, target_ball.id], margin=0.015):
+                            path_clear = False; break
+                    
+                    if path_clear:
+                        # Found a path!
+                        p1 = path_points[1]
+                        vec_shot = p1 - cue_pos
+                        phi = np.degrees(np.arctan2(vec_shot[1], vec_shot[0])) % 360
+                        
+                        # Score
+                        score = 40 + n * 10 # More cushions = harder but cooler/more unexpected
+                        
+                        # Snooker bonus?
+                        # Assume stop at target (rough estimate)
+                        # Kick Safety 通常很难控制停点，但如果我们要给用户信心，
+                        # 我们假设它停在 Target 附近 (撞击后动能损失大)
+                        pred_stop_pos = target_pos
+                        
+                        # [NEW] 模拟评估 (Kick Safety)
+                        # ... (Same logic as before) ...
+                        opp_virtual_cue = VirtualBall('cue', pred_stop_pos, R)
+                        opp_shot_count = 0
+                        if opponent_targets:
+                            sim_balls = balls.copy()
+                            sim_balls['cue'] = opp_virtual_cue
+                            
+                            for opp_target_id in opponent_targets:
+                                if opp_target_id in sim_balls:
+                                    opp_target = sim_balls[opp_target_id]
+                                    for pid, pkt in table.pockets.items():
+                                        opp_sols = self.solve_shot_parameters(opp_virtual_cue, opp_target, pkt, sim_balls, table)
+                                        opp_shot_count += len(opp_sols)
+                        
+                        # 评分：对手解越少，分数越高
+                        if opp_shot_count == 0:
+                            score += 200 # Absolute Snooker
+                        else:
+                            score += max(0, 100 - opp_shot_count * 5)
+                            
+                        # 原有的 heuristic 也可以保留作为补充
+                        if opponent_targets:
+                            snookered = 0
+                            for opp_id in opponent_targets:
+                                if opp_id in balls:
+                                    if not self.is_segment_clear_static(pred_stop_pos, balls[opp_id].state.rvw[0], balls, exclude_ids=[opp_id]):
+                                        snookered += 1
+                            score += snookered * 20
+                            
+                        solutions.append({
+                            'type': 'Safety',
+                            'phi': phi,
+                            'V0': 3.5, # Multi-rail needs more power
+                            'score': score,
+                            'strategy': f'{n}-Rail-Kick-Safety',
+                            'cut_angle': 0,
+                            'ghost': target_pos, # Approx
+                            'predicted_stop_pos': pred_stop_pos,
+                            'cue_seq': [r['name'] for r in seq]
+                        })
+        
+        # 按分数排序
+        solutions.sort(key=lambda x: x['score'], reverse=True)
+        return solutions # 返回所有解，由调用者决定取多少
+
+    def is_segment_clear_static(self, p1, p2, balls, exclude_ids=[], margin=0.0):
+        """静态方法的路径检测，方便内部调用"""
+        vec = p2 - p1
+        length = np.linalg.norm(vec)
+        if length < 1e-6: return True
+        u = vec / length
+        R = 0.028575 # Hardcoded or passed
+        
+        threshold = 2 * R + margin
+
+        for bid, ball in balls.items():
             if ball.state.s == 4: continue
-            if ball_id == cue_ball.id or ball_id == target_ball.id: continue
+            if bid in exclude_ids: continue
             
             pos = ball.state.rvw[0]
-            bx, by = pos[0], pos[1]
+            ap = pos - p1
+            proj = np.dot(ap, u)
+            if proj < 0 or proj > length:
+                dist = min(np.linalg.norm(pos - p1), np.linalg.norm(pos - p2))
+            else:
+                dist = np.linalg.norm(ap - proj * u)
             
-            if point_line_segment_distance(bx, by, cue_pos[0], cue_pos[1], ghost_pos[0], ghost_pos[1]) < 2 * R:
+            if dist < threshold:
                 return False
-            if point_line_segment_distance(bx, by, target_pos[0], target_pos[1], pocket_pos[0], pocket_pos[1]) < 2 * R:
-                return False
-                
         return True
+
+    def is_path_clear(self, cue_ball, target_ball, pocket, balls):
+        return self.is_segment_clear_static(cue_ball.state.rvw[0], target_ball.state.rvw[0], balls, [cue_ball.id, target_ball.id])
