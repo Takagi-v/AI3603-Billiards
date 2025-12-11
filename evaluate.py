@@ -26,7 +26,7 @@ from agent import Agent, BasicAgent, NewAgent
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 2
+n_games = 10
 
 agent_a, agent_b = BasicAgent(), NewAgent()
 
