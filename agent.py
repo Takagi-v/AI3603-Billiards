@@ -421,15 +421,14 @@ class NewAgent(Agent):
         self.default_v0 = 2.4  # 默认力度
         
         # ==================== 多档力度系统 ====================
-        # 5档力度：极小力、小力、中力、大力、极大力
+        # 4档力度：极小力、小力、中力、大力 (移除不稳定的极大力)
         self.power_levels = {
             'very_soft': 1.5,   # 极小力：近距离精细控制
             'soft': 2.5,        # 小力：近距离进球
             'medium': 4.0,      # 中力：中距离进球
             'hard': 5.5,        # 大力：远距离进球
-            'very_hard': 7.0    # 极大力：全台长距离
         }
-        self.power_names = ['very_soft', 'soft', 'medium', 'hard', 'very_hard']
+        self.power_names = ['very_soft', 'soft', 'medium', 'hard']
         
         print("[NewAgent] 模块化架构初始化完成（多档力度系统已启用）")
 
@@ -473,7 +472,7 @@ class NewAgent(Agent):
         attack_threshold = self._get_attack_threshold(remaining_own)
         
         # 筛选符合条件的进攻方案：成功率 >= 60% 斩杀线
-        MIN_SUCCESS_RATE = 0.5  # 成功率斩杀线
+        MIN_SUCCESS_RATE = 0.6  # 成功率斩杀线
         valid_attacks = [opt for opt in attack_options if opt['success_rate'] >= MIN_SUCCESS_RATE]
         
         best_attack_score = valid_attacks[0]['final_score'] if valid_attacks else -100
@@ -730,11 +729,21 @@ class NewAgent(Agent):
                         # 中距离：小力、中力、大力
                         suitable_powers = ['soft', 'medium', 'hard']
                     else:
-                        # 远距离：中力、大力、极大力
-                        suitable_powers = ['medium', 'hard', 'very_hard']
+                        # 远距离：中力、大力 (移除极大力)
+                        suitable_powers = ['medium', 'hard']
                     
-                    # 如果有库边，增加一档力度
+                    # 如果有库边，增加一档力度 (最大到 hard)
                     if cushions > 0:
+                        power_upgrade = {
+                            'very_soft': 'soft',
+                            'soft': 'medium',
+                            'medium': 'hard',
+                            'hard': 'hard'
+                        }
+                        suitable_powers = [power_upgrade.get(p, p) for p in suitable_powers]
+                        # 去重并保持顺序
+                        seen = set()
+                        suitable_powers = [p for p in suitable_powers if not (p in seen or seen.add(p))]
                         base_v0 *= (1.0 + cushions * 0.25)  # [优化] 增加库边力度补偿 (0.2->0.25)
                     
                     # 限制在合理范围
@@ -763,13 +772,13 @@ class NewAgent(Agent):
                             'b': 0
                         }
                         
-                        # 力度评分调整：中等力度略优于极端力度（更稳定）
+                        # 力度评分调整：根据当前场景调整
+                        # 一般情况中等力度加分，但在需要大力的时候（远距离/碰库）hard也会被选择
                         power_score_adj = {
                             'very_soft': -5,  # 极小力可能力度不足
-                            'soft': 0,
-                            'medium': 5,      # 中力最稳定
-                            'hard': 0,
-                            'very_hard': -5   # 极大力控制难
+                            'soft': -2,
+                            'medium': 5,      # 中力较稳
+                            'hard': 2,        # 大力出奇迹（在远距离时更准）
                         }
                         
                         all_candidates.append({
