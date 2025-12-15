@@ -506,6 +506,13 @@ if __name__ == '__main__':
     
     # 初始化任务环境
     env = PoolEnv()
+    
+    # 初始化可视化界面 (单例)
+    try:
+        viewer = pt.ShotViewer()
+    except Exception as e:
+        print(f"初始化 ShotViewer 失败 (可能是在无显示器环境): {e}")
+        viewer = None
 
     agent_a, agent_b = BasicAgent(), NewAgent()
 
@@ -521,16 +528,18 @@ if __name__ == '__main__':
         env.take_shot(action)
         
         # 观看当前杆，使用ESC退出
-        pt.show(env.shot_record[-1], title=f"hit count: {env.hit_count}")
+        if viewer:
+            viewer.show(env.shot_record[-1], title=f"hit count: {env.hit_count}")
         
         done, info = env.get_done()
         if done:
             print("游戏结束.")
-            ## 观看整个击球过程，使用ESC依次观看每一杆
-            for i in range(len(env.shot_record)):
-                pt.show(env.shot_record[i], title=f"hit count: {i}")
-            
-            ## 观看整个过程 使用 p 和 n 控制 上一杆/ 下一杆
-            pt.show(env.shot_record, title=f"all record")
+            if viewer:
+                ## 观看整个击球过程，使用ESC依次观看每一杆
+                for i in range(len(env.shot_record)):
+                    viewer.show(env.shot_record[i], title=f"hit count: {i}")
+                
+                ## 观看整个过程 使用 p 和 n 控制 上一杆/ 下一杆
+                viewer.show(env.shot_record, title=f"all record")
             break
         
