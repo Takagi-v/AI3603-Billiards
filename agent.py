@@ -416,8 +416,8 @@ class NewAgent(Agent):
         }
         
         # 决策参数
-        self.base_attack_threshold = 50  # 进攻阈值基准（已提高）
-        self.default_v0 = 2.5  # 默认力度（后续可优化）
+        self.base_attack_threshold = 55  # [优化] 略微提高进攻门槛 (50->55) 更加稳健
+        self.default_v0 = 2.4  # 默认力度
         
         print("[NewAgent] 模块化架构初始化完成")
 
@@ -651,6 +651,11 @@ class NewAgent(Agent):
                 solutions = self.solve_shot_parameters(cue_ball, target_ball, pocket, balls, table)
                 
                 for sol in solutions:
+                    # [优化] 根据几何特征提前剪枝
+                    # 1. 如果切角过大 (>75度) 且不是翻袋/踢球，直接丢弃 (成功率极低)
+                    if sol['type'] == 'Direct' and sol.get('cut_angle', 0) > 75:
+                        continue
+                    
                     # 根据距离估算力度
                     cue_pos = cue_ball.state.rvw[0]
                     target_pos = target_ball.state.rvw[0]
@@ -662,13 +667,13 @@ class NewAgent(Agent):
                     
                     # 力度估算公式：增加基础力度
                     # 台球桌长约2m，需要较大力度
-                    base_v0 = 2.5 + total_dist * 2.0  # 提高基础值和系数
+                    base_v0 = 2.2 + total_dist * 1.8  # [优化] 略微降低力度系数，避免白球乱飞
                     cushions = sol.get('cushions', 0)
                     if cushions > 0:
-                        base_v0 *= (1.0 + cushions * 0.2)  # 每颗星增加 20% 力度
+                        base_v0 *= (1.0 + cushions * 0.25)  # [优化] 增加库边力度补偿 (0.2->0.25)
                     
                     # 限制在合理范围
-                    estimated_v0 = np.clip(base_v0, 2.5, 7.0)
+                    estimated_v0 = np.clip(base_v0, 2.0, 6.5) # [优化] 上限从 7.0 降至 6.5
                     
                     # 构造动作
                     action = {
@@ -893,18 +898,18 @@ class NewAgent(Agent):
             else:
                 # 普通犯规，正常计算但惩罚权重更高
                 final_score = (
-                    success_rate * 100  # 进球奖励
-                    - foul_rate * 50    # 增加犯规惩罚权重
-                    + avg_position * 0.3  # 走位权重
-                    + avg_penalty * 0.5   # 增加惩罚权重
+                    success_rate * 120  # 进球奖励
+                    - foul_rate * 35    # 增加犯规惩罚权重
+                    + avg_position * 0.25  # 走位权重
+                    + avg_penalty * 0.7   # 增加惩罚权重
                 )
         else:
             # 综合评分公式（正常情况）
             final_score = (
-                success_rate * 100  # 进球奖励
-                - foul_rate * 30    # 犯规惩罚
+                success_rate * 120  # 进球奖励
+                - foul_rate * 35    # 犯规惩罚
                 + avg_position * 0.3  # 走位权重
-                + avg_penalty * 0.3   # 惩罚项
+                + avg_penalty * 0.2   # 惩罚项
             )
         
         return {
@@ -1078,7 +1083,7 @@ class NewAgent(Agent):
                 total_solutions += len(solutions)
         
         # 方案越多，走位越好
-        score += min(total_solutions * 8, 40)  # 上限 40 分
+        score += min(total_solutions * 10, 40)  # 上限 40 分
         
         # 2. 贴库惩罚
         dist_to_rail = min(
@@ -1086,16 +1091,16 @@ class NewAgent(Agent):
             cue_pos[1] - R, table.l - R - cue_pos[1]
         )
         if dist_to_rail < 0.03:  # 3cm 内算贴库
-            score -= 25
+            score -= 30
         elif dist_to_rail < 0.08:  # 8cm 内轻微惩罚
-            score -= 10
+            score -= 12
         
         # 3. 中心区域奖励（便于任意方向出杆）
         center = np.array([table.w / 2, table.l / 2, 0])
         dist_to_center = np.linalg.norm(cue_pos - center)
         max_dist = np.sqrt((table.w / 2) ** 2 + (table.l / 2) ** 2)
         if dist_to_center < max_dist * 0.3:
-            score += 15
+            score += 20
         elif dist_to_center < max_dist * 0.5:
             score += 5
         
@@ -1174,8 +1179,19 @@ class NewAgent(Agent):
             else:
                 defense_score = 60 - opp_shot_count * 5  # 每个对手方案扣5分
             
+            # [优化] 加入对手反击难度评分
+            # 如果对手有球打，但是距离很远(>1.0m)，稍微加点分
+            if opp_shot_count > 0:
+                min_opp_dist = float('inf')
+                for opp_id in opp_targets:
+                    if opp_id in balls_after:
+                         d = np.linalg.norm(cue_final_pos - balls_after[opp_id].state.rvw[0])
+                         if d < min_opp_dist: min_opp_dist = d
+                if min_opp_dist > 1.0:
+                    defense_score += 8 # 远台防守加分
+            
             # 加入启发式预评分
-            defense_score += sol.get('score', 0) * 0.1
+            defense_score += sol.get('score', 0) * 0.2
             
             scored_defenses.append({
                 'action': action,
