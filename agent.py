@@ -1386,11 +1386,11 @@ class NewAgent(Agent):
             
             # [优化] 加入对手反击难度评分
             # 如果对手有球打，但是距离很远(>1.0m)，稍微加点分
-            if opp_shot_count > 0:
+            if len(top_opp_shots) > 0:
                 min_opp_dist = float('inf')
                 for opp_id in opp_targets:
-                    if opp_id in balls_after:
-                         d = np.linalg.norm(cue_final_pos - balls_after[opp_id].state.rvw[0])
+                    if opp_id in balls_after and balls_after[opp_id].state.s != 4:
+                         d = np.linalg.norm(avg_cue_pos - balls_after[opp_id].state.rvw[0])
                          if d < min_opp_dist: min_opp_dist = d
                 if min_opp_dist > 1.0:
                     defense_score += 8 # 远台防守加分
