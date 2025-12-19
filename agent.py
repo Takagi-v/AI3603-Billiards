@@ -2148,14 +2148,13 @@ class NewAgent(Agent):
                 u_out = u_out_vec / norm_out if norm_out > 1e-6 else np.zeros(3)
                 
                 # ==================== 多档力度防守 ====================
-                # 使用5档力度系统替代滚动距离估算
-                # 力度对应大致的滚动距离：very_soft~0.5m, soft~1.0m, medium~1.5m, hard~2.0m, very_hard~2.5m+
+                # 使用4档力度系统替代滚动距离估算 (移除very_hard)
+                # 力度对应大致的滚动距离：very_soft~0.5m, soft~1.0m, medium~1.5m, hard~2.0m
                 roll_dist_mapping = {
                     'very_soft': 0.5,
                     'soft': 1.0,
                     'medium': 1.5,
-                    'hard': 2.0,
-                    'very_hard': 2.5
+                    'hard': 2.0
                 }
                 
                 for power_name in self.power_names:
@@ -2329,18 +2328,18 @@ class NewAgent(Agent):
                         elif path_total_dist < 1.8:
                             kick_powers = ['medium', 'hard']
                         else:
-                            kick_powers = ['hard', 'very_hard']
+                            kick_powers = ['hard']
                         
-                        # 多库需要额外增加力度
+                        # 多库需要额外增加力度 (最大到 hard)
                         if n >= 2:
-                            power_upgrade = {'soft': 'medium', 'medium': 'hard', 'hard': 'very_hard', 'very_hard': 'very_hard'}
+                            power_upgrade = {'soft': 'medium', 'medium': 'hard', 'hard': 'hard'}
                             kick_powers = list(set(power_upgrade.get(p, p) for p in kick_powers))
                         
                         for kick_power in kick_powers:
                             v0_kick = self.power_levels[kick_power]
                             
                             # 力度评分调整
-                            power_adj = {'soft': 5, 'medium': 10, 'hard': 5, 'very_hard': -5}
+                            power_adj = {'soft': 5, 'medium': 10, 'hard': 5}
                             adjusted_score = score + power_adj.get(kick_power, 0)
                             
                             solutions.append({
