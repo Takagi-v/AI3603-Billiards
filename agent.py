@@ -66,6 +66,184 @@ def simulate_with_timeout(shot, timeout=3):
 
 # ============================================
 
+# ============ 走位评分工具函数 (从 agent_new.py 移植) ============
+
+def get_ball_position(ball) -> np.ndarray:
+    """提取球的位置坐标 (x, y, z)"""
+    return ball.state.rvw[0].copy()
+
+
+def get_pocket_position(pocket, table=None) -> np.ndarray:
+    """
+    提取袋口的位置坐标（带中袋偏移修正）
+    
+    中袋（side pockets）的物理袋口边缘比几何中心更靠外，
+    为了提高瞄准稳定性，对中袋的瞄准点向球桌中心方向偏移。
+    
+    参数:
+        pocket: 袋口对象
+        table: 球桌对象（可选，用于判断球桌中心位置）
+    
+    返回:
+        np.ndarray: 袋口位置 (x, y, z)
+    """
+    # 获取原始袋口位置
+    if hasattr(pocket, 'center'):
+        pos = np.array([pocket.center[0], pocket.center[1], 0])
+    elif hasattr(pocket, 'a'):
+        pos = np.array([pocket.a, pocket.b, 0])
+    else:
+        pos = np.array([pocket.x, pocket.y, 0])
+    
+    # 对中袋（side pockets）添加偏移
+    # 中袋的ID通常包含 'c' (center)，如 'lc', 'rc'
+    pocket_id = getattr(pocket, 'id', '')
+    if 'c' in pocket_id.lower():
+        # 中袋偏移：向球桌中心方向偏移
+        # 袋口半径约 0.0645m，偏移半径的 50%
+        r_side = 0.0645
+        offset = r_side * 0.5
+        
+        # 判断是左中袋还是右中袋
+        if pos[0] < 0.5:  # 左中袋
+            pos[0] += offset  # 向右（中心）偏移
+        else:  # 右中袋
+            pos[0] -= offset  # 向左（中心）偏移
+    
+    return pos
+
+
+def calculate_angle(v1: np.ndarray, v2: np.ndarray) -> float:
+    """
+    计算两个向量之间的夹角（度数）
+    
+    返回:
+        float: 夹角，范围 [0, 180]
+    """
+    v1_norm = np.linalg.norm(v1)
+    v2_norm = np.linalg.norm(v2)
+    if v1_norm < 1e-9 or v2_norm < 1e-9:
+        return 0.0
+    cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return math.degrees(math.acos(cos_angle))
+
+
+def score_single_target_position(
+    cue_pos: np.ndarray,
+    target_ball,
+    pocket,
+    table
+) -> float:
+    """
+    计算针对单个目标球的走位评分
+    
+    评分维度:
+        1. 目标球到袋口的距离 (越近越好)
+        2. 母球到目标球的距离 (适中最好，太近太远都扣分)
+        3. 母球-目标球连线 与 目标球-袋口连线 的夹角 (越接近180°越好 = 直球)
+    
+    参数:
+        cue_pos: 母球位置 (x, y, z)
+        target_ball: 目标球对象
+        pocket: 袋口对象
+        table: 球桌对象
+    
+    返回:
+        float: 单目标走位分 (0-50)
+    """
+    target_pos = get_ball_position(target_ball)
+    pocket_pos = get_pocket_position(pocket)
+    
+    # 只取 xy 平面
+    cue_xy = cue_pos[:2]
+    target_xy = target_pos[:2]
+    pocket_xy = pocket_pos[:2]
+    
+    # ========== 1. 目标球到袋口距离评分 ==========
+    # 距离越近越好，满分15分
+    dist_target_to_pocket = np.linalg.norm(target_xy - pocket_xy)
+    max_dist = 2.5  # 假设球桌对角线长度约 2.5m
+    dist_ratio = min(dist_target_to_pocket / max_dist, 1.0)
+    dist_pocket_score = 15 * (1 - dist_ratio)
+    
+    # ========== 2. 母球到目标球距离评分 ==========
+    # 适中距离最好（约0.3-0.8m），太近出杆困难，太远精度下降
+    dist_cue_to_target = np.linalg.norm(cue_xy - target_xy)
+    optimal_min = 0.3
+    optimal_max = 0.8
+    
+    if dist_cue_to_target < 0.1:
+        dist_cue_score = 2  # 贴球，严重扣分
+    elif dist_cue_to_target < optimal_min:
+        dist_cue_score = 7 + 5 * ((dist_cue_to_target - 0.1) / (optimal_min - 0.1))
+    elif dist_cue_to_target <= optimal_max:
+        dist_cue_score = 15  # 最佳距离范围，满分
+    elif dist_cue_to_target < 1.5:
+        dist_cue_score = 15 - 8 * ((dist_cue_to_target - optimal_max) / (1.5 - optimal_max))
+    else:
+        dist_cue_score = 5  # 太远
+    
+    # ========== 3. 夹角评分 ==========
+    vec_cue_to_target = target_xy - cue_xy
+    vec_target_to_pocket = pocket_xy - target_xy
+    
+    # 计算夹角（越接近180度越好 = 直球）
+    angle = calculate_angle(vec_cue_to_target, vec_target_to_pocket)
+    angle_score = 20 * (angle / 180.0)
+    
+    # ========== 总分 ==========
+    total_score = dist_pocket_score + dist_cue_score + angle_score
+    
+    return total_score
+
+
+def score_position(
+    cue_pos: np.ndarray,
+    remaining_targets: list,
+    balls_after: dict,
+    table
+) -> float:
+    """
+    评估白球停点质量 - 遍历所有剩余目标球，取最高分
+    
+    对于每个剩余目标球，遍历6个袋口，计算走位评分，
+    最终返回所有组合中的最高分
+    
+    参数:
+        cue_pos: 白球最终位置 (x, y, z) 或 (x, y)
+        remaining_targets: 剩余己方目标球ID列表
+        balls_after: 模拟后的球状态 {ball_id: Ball}
+        table: 球桌对象
+    
+    返回:
+        float: 走位评分 (0-50)
+    """
+    if len(cue_pos) == 2:
+        cue_pos = np.array([cue_pos[0], cue_pos[1], 0])
+    
+    # 如果没有剩余目标球，检查是否该打黑8
+    if not remaining_targets:
+        remaining_targets = ['8']
+    
+    best_score = 0.0
+    
+    for target_id in remaining_targets:
+        if target_id not in balls_after:
+            continue
+        target_ball = balls_after[target_id]
+        if target_ball.state.s == 4:  # 已进袋
+            continue
+        
+        # 遍历所有袋口
+        for pocket_id, pocket in table.pockets.items():
+            score = score_single_target_position(cue_pos, target_ball, pocket, table)
+            if score > best_score:
+                best_score = score
+    
+    return best_score
+
+# ============================================
 
 
 def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
@@ -379,16 +557,6 @@ class BasicAgent(Agent):
             traceback.print_exc()
             return self._random_action()
 
-class VirtualState:
-    def __init__(self, pos):
-        self.rvw = np.array([np.array(pos), np.zeros(3), np.zeros(3)])
-        self.s = 1
-
-class VirtualBall:
-    def __init__(self, ball_id, pos, R=0.028575):
-        self.id = ball_id
-        self.state = VirtualState(pos)
-        self.params = type('Params', (), {'R': R})()
 
 class NewAgent(Agent):
     """
@@ -406,10 +574,7 @@ class NewAgent(Agent):
     def __init__(self):
         super().__init__()
         # 蒙特卡洛模拟参数
-        self.num_simulation = 20       # 精细模拟次数（增加以提高稳定性）
-        self.num_quick_simulation = 5  # 快速筛选模拟次数
-        self.top_k_candidates = 8      # 精细模拟的候选数量（增加以找到更好的方案）
-        self.stage1_candidates = 25    # 第一阶段候选数量
+        self.num_simulation = 10       # 精细模拟次数
         
         # 噪声参数（与环境一致）
         self.noise_std = {
@@ -417,20 +582,21 @@ class NewAgent(Agent):
         }
         
         # 决策参数
-        self.base_attack_threshold = 55  # [优化] 略微提高进攻门槛 (50->55) 更加稳健
+        self.base_attack_threshold = 55  # 进攻门槛
         self.default_v0 = 2.4  # 默认力度
         
         # ==================== 多档力度系统 ====================
-        # 4档力度：极小力、小力、中力、大力 (移除不稳定的极大力)
+        # 5档力度：极小力、小力、中力、大力、极大力
         self.power_levels = {
             'very_soft': 1.5,   # 极小力：近距离精细控制
             'soft': 2.5,        # 小力：近距离进球
             'medium': 4.0,      # 中力：中距离进球
             'hard': 5.5,        # 大力：远距离进球
+            'very_hard': 7.0,   # 极大力：超远距离/穿透
         }
-        self.power_names = ['very_soft', 'soft', 'medium', 'hard']
+        self.power_names = ['very_soft', 'soft', 'medium', 'hard', 'very_hard']
         
-        print("[NewAgent] 模块化架构初始化完成（多档力度系统已启用）")
+        print("[NewAgent] 简化版架构初始化完成（两阶段筛选 + 10次精细模拟）")
 
     # ==================== 主决策入口 ====================
     
@@ -498,27 +664,26 @@ class NewAgent(Agent):
             print(f"{'='*60}\n")
             return action
         else:
-            # 5. 防守模式
-            print(f"\n  进攻分数不足或无高成功率方案，切换防守模式...")
-            print(f"\n  === 防守评估 ===")
+            # 5. 没有高成功率方案，选择次优或保守击球
+            print(f"\n  进攻分数不足或无高成功率方案...")
             
-            opp_targets = self._get_opponent_targets(my_targets)
-            defense_options = self.evaluate_defense_options(balls, legal_targets, opp_targets, table)
-            
-            if defense_options and defense_options[0]['defense_score'] > -50:
-                best = defense_options[0]
-                action = best['action']
-                print(f"\n  >>> 决策: 防守!")
-                print(f"      策略: {best.get('strategy', 'Unknown')}")
-                print(f"      动作: V0={action['V0']:.2f}, phi={action['phi']:.1f}°")
-                print(f"      预测白球停点: ({best.get('predicted_stop', [0,0,0])[0]:.2f}, {best.get('predicted_stop', [0,0,0])[1]:.2f})")
-                print(f"      对手最佳: {best.get('opp_best_score', 0):.1f}, 防守得分: {best['defense_score']:.1f}")
+            # 尝试从所有方案中选择最佳的（即使成功率不够高）
+            if attack_options:
+                fallback = attack_options[0]
+                action = fallback['action']
+                cushions = fallback.get('cushions', 0)
+                cushion_str = f"{cushions}库" if cushions > 0 else "直球"
+                print(f"\n  >>> 决策: 尝试进攻 (次优方案)")
+                print(f"      目标: {fallback['target_id']} -> {fallback['pocket_id']}")
+                print(f"      类型: {fallback['shot_type']} ({cushion_str})")
+                print(f"      力度档位: {fallback.get('power_level', 'N/A')} (V0={action['V0']:.1f})")
+                print(f"      成功率: {fallback['success_rate']:.0%}, 总分: {fallback['final_score']:.1f}")
                 print(f"{'='*60}\n")
                 return action
             else:
-                # Fallback: 轻打向目标球（保守防守）
-                print(f"\n  >>> 决策: 保守防守 (极小力轻打目标球)")
-                action = self._fallback_defense(balls, legal_targets[0], table)
+                # 无任何方案，保守轻打目标球
+                print(f"\n  >>> 决策: 保守击球 (极小力轻打目标球)")
+                action = self._conservative_shot(balls, legal_targets[0], table)
                 print(f"      力度档位: very_soft (V0={action['V0']:.1f})")
                 print(f"      角度: phi={action['phi']:.1f}°")
                 print(f"{'='*60}\n")
@@ -535,10 +700,10 @@ class NewAgent(Agent):
             return base * 1.2  # 还早，保守
         return base
 
-    def _fallback_defense(self, balls, target_id, table):
+    def _conservative_shot(self, balls, target_id, table):
         """
-        保守防守 fallback：轻打向目标球
-        当没有找到任何防守方案时使用
+        保守击球：轻打向目标球
+        当没有找到任何可行进攻方案时使用
         使用力度系统的最小力档位
         """
         cue_pos = balls['cue'].state.rvw[0]
@@ -556,16 +721,6 @@ class NewAgent(Agent):
             'a': 0,
             'b': 0
         }
-
-    def _get_opponent_targets(self, my_targets):
-        """获取对手目标球"""
-        all_solids = [str(i) for i in range(1, 8)]
-        all_stripes = [str(i) for i in range(9, 16)]
-        
-        if my_targets[0] in all_solids or (my_targets == ['8'] and '1' in all_solids):
-            return all_stripes
-        else:
-            return all_solids
 
     def _is_break_shot(self, balls, table):
         """
@@ -605,72 +760,187 @@ class NewAgent(Agent):
 
     def _break_shot_action(self, balls, table, my_targets):
         """
-        生成开球动作（改进版）
+        生成开球动作（带模拟验证）
         
         策略：
-        1. 找到己方目标球中最靠近白球的球（排除黑8）
-        2. 大力击向该目标球
-        3. 确保首球接触的是己方球
+        1. 找到球堆边缘的球（y坐标最小，最靠近白球）
+        2. 生成多个开球候选方案（不同力度、角度微调）
+        3. 对每个方案进行模拟验证
+        4. 选择最安全且最有利的方案（不犯规、不打进黑8、优先进己方球）
         """
         cue_pos = balls['cue'].state.rvw[0]
         
-        # 过滤目标球：排除黑8
-        valid_targets = [t for t in my_targets if t != '8']
-        
-        # 如果 valid_targets 为空（可能还没分配目标球），使用所有非黑8球
-        if not valid_targets:
-            # 根据 my_targets 判断是实球还是花球
-            if my_targets and my_targets[0] in [str(i) for i in range(1, 8)]:
-                valid_targets = [str(i) for i in range(1, 8)]  # 实球 1-7
-            elif my_targets and my_targets[0] in [str(i) for i in range(9, 16)]:
-                valid_targets = [str(i) for i in range(9, 16)]  # 花球 9-15
-            else:
-                # 默认使用所有球（除了黑8）
-                valid_targets = [str(i) for i in range(1, 8)] + [str(i) for i in range(9, 16)]
-        
-        # 找到己方目标球中最靠近球堆顶端的球（y坐标最小）
-        best_target = None
-        best_target_pos = None
-        min_y = float('inf')
-        
-        for target_id in valid_targets:
-            if target_id in balls and balls[target_id].state.s != 4:
-                target_pos = balls[target_id].state.rvw[0]
-                # 找到 y 坐标最小的球（最靠近白球方向）
-                if target_pos[1] < min_y:
-                    min_y = target_pos[1]
-                    best_target = target_id
-                    best_target_pos = target_pos
-        
-        if best_target_pos is None:
-            # 如果没找到目标球，使用球堆中心作为 fallback（但排除黑8）
-            positions = []
-            for target_id in valid_targets:
-                if target_id in balls and balls[target_id].state.s != 4:
-                    positions.append(balls[target_id].state.rvw[0][:2])
-            
-            if positions:
-                rack_center = np.mean(positions, axis=0)
-                target_pos_2d = rack_center
-            else:
-                target_pos_2d = np.array([table.w / 2, table.l * 0.75])
+        # 确定己方和对方目标球
+        if my_targets and my_targets[0] in [str(i) for i in range(1, 8)]:
+            my_ball_ids = [str(i) for i in range(1, 8)]
+            opponent_ball_ids = [str(i) for i in range(9, 16)]
         else:
-            target_pos_2d = best_target_pos[:2]
+            my_ball_ids = [str(i) for i in range(9, 16)]
+            opponent_ball_ids = [str(i) for i in range(1, 8)]
         
-        # 计算击球角度
-        direction = target_pos_2d - cue_pos[:2]
-        phi = np.degrees(np.arctan2(direction[1], direction[0])) % 360
+        # 只从己方球中找边缘球（y坐标最小的几个，最靠近白球）
+        edge_balls = []
+        for bid in my_ball_ids:
+            if bid not in balls or balls[bid].state.s == 4:
+                continue
+            pos = balls[bid].state.rvw[0]
+            edge_balls.append((bid, pos[1], pos))
         
-        print(f"  [开球] 瞄准目标球: {best_target if best_target else '己方球堆中心'} (排除黑8)")
+        # 按 y 坐标排序，取最靠近白球的3个作为候选瞄准点
+        edge_balls.sort(key=lambda x: x[1])
+        candidate_targets = edge_balls[:3]
         
-        # 大力开球
-        return {
-            'V0': 7.5,  # 大力
-            'phi': phi,
-            'theta': 0,
-            'a': 0,
-            'b': 0
-        }
+        # 如果己方边缘球不足3个，补充所有己方球
+        if len(candidate_targets) < 3:
+            for bid in my_ball_ids:
+                if bid not in [t[0] for t in candidate_targets]:
+                    if bid in balls and balls[bid].state.s != 4:
+                        pos = balls[bid].state.rvw[0]
+                        candidate_targets.append((bid, pos[1], pos))
+                        if len(candidate_targets) >= 2:  # 只选2个边缘球
+                            break
+        
+        print(f"  [开球] 己方边缘球候选: {[b[0] for b in candidate_targets]}")
+        
+        # 生成开球候选方案 (精简版: 2目标 × 3角度 × 2力度 = 12个)
+        break_candidates = []
+        
+        for target_id, _, target_pos in candidate_targets[:2]:  # 只取2个目标
+            direction = target_pos[:2] - cue_pos[:2]
+            base_phi = np.degrees(np.arctan2(direction[1], direction[0])) % 360
+            
+            # 角度微调范围：-2°, 0, +2°
+            for phi_offset in [-2, 0, 2]:
+                phi = (base_phi + phi_offset) % 360
+                
+                # 力度选择
+                for v0 in [6.5, 7.5]:
+                    action = {'V0': v0, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0}
+                    break_candidates.append({
+                        'action': action,
+                        'target_id': target_id,
+                        'phi_offset': phi_offset
+                    })
+        
+        print(f"  [开球] 共生成 {len(break_candidates)} 个开球候选方案，开始模拟验证 (每方案3次)...")
+        
+        # 模拟验证每个方案 (3次模拟)
+        NUM_BREAK_SIM = 3
+        scored_candidates = []
+        
+        for candidate in break_candidates:
+            action = candidate['action']
+            
+            total_score = 0
+            foul_count = 0
+            my_pocketed_total = 0
+            first_hit_record = None
+            
+            for sim_i in range(NUM_BREAK_SIM):
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                # 添加噪声模拟
+                noisy_action = self._add_noise(action) if sim_i > 0 else action
+                shot.cue.set_state(**noisy_action)
+                
+                if not simulate_with_timeout(shot, timeout=3):
+                    foul_count += 1
+                    continue
+                
+                # 分析结果
+                cue_pocketed = shot.balls['cue'].state.s == 4
+                eight_pocketed = shot.balls['8'].state.s == 4
+                
+                my_pocketed = [bid for bid in my_ball_ids 
+                              if bid in shot.balls and shot.balls[bid].state.s == 4]
+                opponent_pocketed = [bid for bid in opponent_ball_ids 
+                                    if bid in shot.balls and shot.balls[bid].state.s == 4]
+                
+                # 检测首球接触 - 排除 cue_stick 和非球ID
+                first_hit = None
+                for event in shot.events:
+                    if hasattr(event, 'ids') and 'cue' in event.ids:
+                        other = [bid for bid in event.ids if bid != 'cue' and bid != 'cue_stick' and bid in balls]
+                        if other:
+                            first_hit = other[0]
+                            break
+                
+                if sim_i == 0:
+                    first_hit_record = first_hit
+                
+                # 计算单次模拟评分
+                sim_score = 0
+                is_foul = False
+                
+                if cue_pocketed:
+                    sim_score -= 500
+                    is_foul = True
+                if eight_pocketed:
+                    sim_score -= 1000
+                    is_foul = True
+                
+                if first_hit:
+                    if first_hit in opponent_ball_ids:
+                        sim_score -= 100
+                        is_foul = True
+                    elif first_hit in my_ball_ids:
+                        sim_score += 50
+                
+                # 己方进球：递增加分 (1个=80, 2个=160, 3个=240...)
+                # 公式: n * 80 * n = 80 * n^2，鼓励多进球
+                n_my = len(my_pocketed)
+                sim_score += 80 * n_my * n_my
+                
+                # 对方进球扣分
+                sim_score -= len(opponent_pocketed) * 40
+                
+                if not is_foul:
+                    sim_score += 100
+                else:
+                    foul_count += 1
+                
+                total_score += sim_score
+                my_pocketed_total += len(my_pocketed)
+            
+            # 汇总评分
+            avg_score = total_score / NUM_BREAK_SIM
+            foul_rate = foul_count / NUM_BREAK_SIM
+            
+            # 犯规率高的方案降权
+            final_score = avg_score * (1 - foul_rate * 0.5)
+            
+            candidate['score'] = final_score
+            candidate['foul_rate'] = foul_rate
+            candidate['avg_my_pocketed'] = my_pocketed_total / NUM_BREAK_SIM
+            candidate['first_hit'] = first_hit_record
+            
+            scored_candidates.append(candidate)
+        
+        scored_candidates.sort(key=lambda x: -x['score'])
+        
+        if scored_candidates:
+            best = scored_candidates[0]
+            action = best['action']
+            foul_rate = best.get('foul_rate', 0)
+            status = "✓ 安全" if foul_rate < 0.2 else ("⚠ 风险中" if foul_rate < 0.5 else "⛔ 高风险")
+            
+            print(f"  [开球] 选择: 瞄准={best['target_id']}, V0={action['V0']:.1f}, phi={action['phi']:.1f}°")
+            print(f"  [开球] 预测: {status} | 首触={best.get('first_hit', 'N/A')} | "
+                  f"犯规率={foul_rate:.0%} | 平均进球={best['avg_my_pocketed']:.1f} | 分数={best['score']:.0f}")
+            return action
+        else:
+            print(f"  [开球] 无有效方案，使用默认开球")
+            if candidate_targets:
+                target_pos = candidate_targets[0][2]
+                direction = target_pos[:2] - cue_pos[:2]
+                phi = np.degrees(np.arctan2(direction[1], direction[0])) % 360
+            else:
+                phi = 90
+            return {'V0': 7.0, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0}
 
     # ==================== 进攻评估 ====================
     
@@ -679,10 +949,11 @@ class NewAgent(Agent):
         评估所有进攻选项
         
         流程:
-        1. 遍历所有 (目标球, 袋口) 组合
-        2. 几何求解获取候选角度
-        3. 快速筛选 Top-K
-        4. 对 Top-K 精细模拟评分
+        1. 遍历所有 (目标球, 袋口, 力度档位) 组合
+        2. 对每个方案进行无噪声模拟验证一次
+        3. 根据模拟结果评分，筛选有效方案 Top-8
+        4. 对 Top-8 进行 10 次精细模拟
+        5. 返回按 final_score 排序的结果
         
         返回:
             list: 按 final_score 降序排列的方案列表
@@ -729,37 +1000,20 @@ class NewAgent(Agent):
                         # 中距离：小力、中力、大力
                         suitable_powers = ['soft', 'medium', 'hard']
                     else:
-                        # 远距离：中力、大力 (移除极大力)
-                        suitable_powers = ['medium', 'hard']
+                        # 远距离：中力、大力、极大力
+                        suitable_powers = ['medium', 'hard', 'very_hard']
                     
-                    # 如果有库边，增加一档力度 (最大到 hard)
+                    # 如果有库边，增加一档力度 (最大到 very_hard)
                     if cushions > 0:
                         power_upgrade = {
                             'very_soft': 'soft',
                             'soft': 'medium',
                             'medium': 'hard',
-                            'hard': 'hard'
+                            'hard': 'very_hard',
+                            'very_hard': 'very_hard'
                         }
-                        suitable_powers = [power_upgrade.get(p, p) for p in suitable_powers]
-                        # 去重并保持顺序
-                        seen = set()
-                        suitable_powers = [p for p in suitable_powers if not (p in seen or seen.add(p))]
-                        base_v0 *= (1.0 + cushions * 0.25)  # [优化] 增加库边力度补偿 (0.2->0.25)
+                        suitable_powers = list(dict.fromkeys([power_upgrade.get(p, p) for p in suitable_powers]))
                     
-                    # 限制在合理范围
-                    estimated_v0 = np.clip(base_v0, 2.0, 6.5) # [优化] 上限从 7.0 降至 6.5
-                    
-                    # 构造动作
-                    action = {
-                        'V0': estimated_v0,
-                        'phi': sol['phi'],
-                        'theta': 0,
-                        'a': 0,
-                        'b': 0
-                    }
-                    
-                    # 快速评分（基于几何特征）
-                    quick_score = self._quick_score(sol)
                     
                     for power_name in suitable_powers:
                         v0 = self.power_levels[power_name]
@@ -772,15 +1026,6 @@ class NewAgent(Agent):
                             'b': 0
                         }
                         
-                        # 力度评分调整：根据当前场景调整
-                        # 一般情况中等力度加分，但在需要大力的时候（远距离/碰库）hard也会被选择
-                        power_score_adj = {
-                            'very_soft': -5,  # 极小力可能力度不足
-                            'soft': -2,
-                            'medium': 5,      # 中力较稳
-                            'hard': 2,        # 大力出奇迹（在远距离时更准）
-                        }
-                        
                         all_candidates.append({
                             'action': action,
                             'target_id': target_id,
@@ -788,90 +1033,98 @@ class NewAgent(Agent):
                             'shot_type': sol['type'],
                             'cut_angle': sol.get('cut_angle', 0),
                             'cushions': cushions,
-                            'quick_score': quick_score + power_score_adj.get(power_name, 0),
-                            'solution': sol,
-                            'power_level': power_name
+                            'power_level': power_name,
+                            'solution': sol
                         })
         
         if not all_candidates:
             return []
         
-        # Step 3: 快速筛选 Top-K（按几何评分）
-        all_candidates.sort(key=lambda x: -x['quick_score'])
+        print(f"  [阶段1] 共生成 {len(all_candidates)} 个候选方案")
         
-        # ==================== 三阶段筛选 ====================
+        # ==================== 阶段1: 无噪声模拟验证 ====================
+        print(f"  [阶段1] 无噪声模拟验证中...")
         
-        # 第一阶段：对 Top-25 进行快速模拟（5次），筛选出有进球可能的方案
-        stage1_candidates = all_candidates[:self.stage1_candidates]
-        stage1_results = []
+        verified_candidates = []
         
-        print(f"  [阶段1] 快速模拟 {len(stage1_candidates)} 个候选...")
-        
-        for candidate in stage1_candidates:
-            # 快速模拟（5次）
-            quick_result = self._quick_simulate(
+        for candidate in all_candidates:
+            # 无噪声模拟一次
+            result = self._single_simulate(
                 candidate['action'],
                 balls,
                 table,
                 candidate['target_id'],
                 legal_targets
             )
-            candidate['quick_success_rate'] = quick_result['success_rate']
-            candidate['quick_foul_rate'] = quick_result['foul_rate']
             
-            # 筛选条件：
-            # 1. 成功率 > 0 且犯规率 < 60%
-            # 2. 或者是直球且切角较小（值得再试）
-            is_direct_small_cut = (candidate['shot_type'] == 'Direct' and 
-                                   candidate.get('cut_angle', 90) < 50)
+            # 保存结果
+            candidate['verify_success'] = result['is_success']
+            candidate['verify_foul'] = result['is_foul']
+            candidate['verify_position'] = result.get('position_score', 0)
             
-            if quick_result['success_rate'] > 0 and quick_result['foul_rate'] < 0.6:
-                stage1_results.append(candidate)
-            elif is_direct_small_cut and quick_result['foul_rate'] < 0.4:
-                # 小切角直球即使快速模拟没进也值得精细模拟
-                candidate['second_chance'] = True
-                stage1_results.append(candidate)
+            # 计算验证阶段评分
+            if result['is_success'] and not result['is_foul']:
+                # 成功进球且无犯规: 高分
+                verify_score = 100 + result.get('position_score', 0)
+            elif result['is_success'] and result['is_foul']:
+                # 进球但犯规: 中分
+                verify_score = 30
+            elif not result['is_foul']:
+                # 未进球但无犯规: 低分
+                verify_score = 10
+            else:
+                # 犯规且未进球: 负分
+                verify_score = -20
+            
+            # 切角惩罚
+            verify_score -= candidate.get('cut_angle', 0) * 0.3
+            # 库边惩罚
+            verify_score -= candidate.get('cushions', 0) * 10
+            
+            candidate['verify_score'] = verify_score
+            
+            # 只保留有效方案 (进球 或 无犯规)
+            if result['is_success'] or not result['is_foul']:
+                verified_candidates.append(candidate)
         
-        print(f"  [阶段1] 有效方案: {len(stage1_results)} 个")
+        print(f"  [阶段1] 有效方案: {len(verified_candidates)} 个")
         
-        if not stage1_results:
-            # 如果没有有效方案，退而求其次选择原始 Top-8
-            stage1_results = stage1_candidates[:8]
-            print(f"  [阶段1] 无有效方案，使用原始 Top-8")
+        if not verified_candidates:
+            # 无有效方案，选择评分最高的原始候选
+            all_candidates.sort(key=lambda x: -x.get('verify_score', -100))
+            verified_candidates = all_candidates[:8]
+            print(f"  [阶段1] 无有效方案，使用评分 Top-10")
         
-        # 第二阶段：按快速成功率排序，取 Top-8 进入精细模拟
-        # 优先级：成功率 > 切角小 > 几何评分
-        stage1_results.sort(key=lambda x: (
-            -x['quick_success_rate'],
-            x.get('cut_angle', 90),  # 切角小优先
-            -x['quick_score']
-        ))
-        stage2_candidates = stage1_results[:self.top_k_candidates]
+        # ==================== 阶段2: Top-10 精细模拟 ====================
+        # 按验证评分排序
+        verified_candidates.sort(key=lambda x: -x['verify_score'])
+        top_candidates = verified_candidates[:10]
         
-        # 第三阶段：对 Top-8 进行精细模拟（20次）
-        print(f"  [阶段2] 精细模拟 Top-{len(stage2_candidates)} 候选:")
+        print(f"  [阶段2] 精细模拟 Top-{len(top_candidates)} 候选 (10次):")
         
         scored_candidates = []
-        for idx, candidate in enumerate(stage2_candidates):
+        for idx, candidate in enumerate(top_candidates):
+            # 10次精细模拟
             score_result = self.simulate_and_score(
                 candidate['action'],
                 balls,
                 table,
                 candidate['target_id'],
-                legal_targets
+                legal_targets,
+                num_simulations=10
             )
             
             candidate.update(score_result)
             scored_candidates.append(candidate)
             
-            # 详细调试输出：每个候选方案
+            # 输出调试信息
             action = candidate['action']
             cushions = candidate.get('cushions', 0)
             cushion_str = f"{cushions}库" if cushions > 0 else "直球"
             
             print(f"    [{idx+1}] 目标={candidate['target_id']} -> {candidate['pocket_id']} "
                   f"| 类型={candidate['shot_type']}({cushion_str}) "
-                  f"| 力度={candidate.get('power_level', 'N/A')}({action['V0']:.1f}) phi={action['phi']:.1f}° "
+                  f"| 力度={candidate['power_level']}({action['V0']:.1f}) phi={action['phi']:.1f}° "
                   f"| 成功率={score_result['success_rate']:.0%} 犯规率={score_result['foul_rate']:.0%} "
                   f"| 走位={score_result['position_score']:.1f} "
                   f"| 总分={score_result['final_score']:.1f}")
@@ -880,80 +1133,54 @@ class NewAgent(Agent):
         scored_candidates.sort(key=lambda x: -x['final_score'])
         return scored_candidates
 
-    def _quick_simulate(self, action, balls, table, target_id, my_targets):
-        """
-        快速模拟（第一阶段筛选用）
-        只模拟3次，快速判断是否有进球可能
-        """
-        success_count = 0
-        foul_count = 0
-        
-        sim_table = copy.deepcopy(table)
-        cue = pt.Cue(cue_ball_id="cue")
-        
-        for _ in range(self.num_quick_simulation):  # 使用配置的模拟次数
-            noisy_action = self._add_noise(action)
-            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-            balls_state_before = {bid: ball.state.s for bid, ball in sim_balls.items()}
-            
-            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-            shot.cue.set_state(**noisy_action)
-            pt.simulate(shot, inplace=True)
-            
-            result = self._analyze_shot_result(shot, balls_state_before, target_id, my_targets)
-            
-            if result['is_success']:
-                success_count += 1
-            if result['is_foul']:
-                foul_count += 1
-        
-        return {
-            'success_rate': success_count / self.num_quick_simulation,
-            'foul_rate': foul_count / self.num_quick_simulation
-        }
-
-    def _quick_score(self, solution):
-        """
-        快速评分（基于几何特征，不进行模拟）
-        用于预筛选候选方案
-        """
-        score = 100
-        
-        # 1. 类型评分：直球优于翻袋/踢球
-        shot_type = solution['type']
-        if shot_type == 'Direct':
-            score += 40  # 直球大幅加分
-        elif shot_type == 'Bank':
-            score -= 15
-        elif shot_type == 'Kick':
-            score -= 20
-        elif 'Kick-Bank' in shot_type:
-            score -= 35  # 复合球风险更高
-        
-        # 2. 切角评分：切角越小越容易进
-        cut_angle = solution.get('cut_angle', 0)
-        if cut_angle < 15:
-            score += 20  # 接近直球
-        elif cut_angle < 30:
-            score += 10  # 小切角
-        elif cut_angle < 45:
-            score += 0   # 中等切角
-        elif cut_angle < 60:
-            score -= 10  # 较大切角
-        else:
-            score -= 25  # 大切角，难度很高
-        
-        # 3. 库边数评分
-        cushions = solution.get('cushions', 0)
-        score -= cushions * 20  # 每次碰库扣20分
-        
-        return score
 
     # ==================== 蒙特卡洛模拟 ====================
     
-    def simulate_and_score(self, action, balls, table, target_id, my_targets):
+    def _single_simulate(self, action, balls, table, target_id, my_targets):
+        """
+        无噪声单次模拟
+        
+        返回:
+            dict: {
+                'is_success': 是否进球,
+                'is_foul': 是否犯规,
+                'position_score': 走位评分 (如果进球且无犯规)
+            }
+        """
+        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        sim_table = copy.deepcopy(table)
+        cue = pt.Cue(cue_ball_id="cue")
+        
+        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+        shot.cue.set_state(**action)
+        
+        # 保存模拟前状态
+        balls_state_before = {bid: balls[bid].state.s for bid in balls}
+        
+        # 带超时保护的模拟
+        if not simulate_with_timeout(shot, timeout=3):
+            return {'is_success': False, 'is_foul': True, 'position_score': 0}
+        
+        # 分析结果
+        result = self._analyze_shot_result(shot, balls_state_before, target_id, my_targets)
+        
+        # 计算走位评分
+        position_score = 0
+        if result['is_success'] and not result['is_foul']:
+            cue_final_pos = result['cue_final_pos']
+            remaining = [t for t in my_targets if t != target_id and shot.balls[t].state.s != 4]
+            if remaining:
+                position_score = self._evaluate_position(cue_final_pos, remaining, shot.balls, table)
+        
+        result['position_score'] = position_score
+        return result
+    
+    def simulate_and_score(self, action, balls, table, target_id, my_targets, num_simulations=None):
         """
         对单个动作进行蒙特卡洛模拟，返回综合评分
+        
+        参数:
+            num_simulations: 模拟次数，默认使用 self.num_simulation
         
         返回:
             dict: {
@@ -963,6 +1190,9 @@ class NewAgent(Agent):
                 'final_score': 综合评分
             }
         """
+        if num_simulations is None:
+            num_simulations = self.num_simulation
+            
         success_count = 0
         foul_count = 0
         position_scores = []
@@ -971,7 +1201,7 @@ class NewAgent(Agent):
         sim_table = copy.deepcopy(table)
         cue = pt.Cue(cue_ball_id="cue")
         
-        for i in range(self.num_simulation):
+        for i in range(num_simulations):
             # 1. 添加噪声
             noisy_action = self._add_noise(action)
             
@@ -1005,13 +1235,13 @@ class NewAgent(Agent):
                 penalty_total += result['penalty']
         
         # 汇总
-        success_rate = success_count / self.num_simulation
-        foul_rate = foul_count / self.num_simulation
+        success_rate = success_count / num_simulations
+        foul_rate = foul_count / num_simulations
         avg_position = np.mean(position_scores) if position_scores else 0
-        avg_penalty = penalty_total / self.num_simulation
+        avg_penalty = penalty_total / num_simulations
         
         # 如果存在致命犯规风险（任何一次模拟中出现 -500 以下的惩罚），直接返回极低分
-        if penalty_total / self.num_simulation <= -50:  # 平均惩罚超过50说明有严重犯规
+        if penalty_total / num_simulations <= -50:  # 平均惩罚超过50说明有严重犯规
             # 检查是否有致命犯规（-500 或 -1000 的惩罚）
             fatal_penalty = penalty_total <= -500  # 累计惩罚很高说明有多次严重犯规
             if fatal_penalty:
@@ -1147,8 +1377,26 @@ class NewAgent(Agent):
             is_foul = True
             penalty = -50
         
-        # 7. 未碰库
-        elif not new_pocketed and not (cue_hit_cushion or target_hit_cushion):
+        # 7. 首球接触犯规 - 先碰到对方球或黑八（非打黑八时）
+        elif first_contact:
+            # 确定对方目标球
+            if my_targets and my_targets[0] in [str(i) for i in range(1, 8)]:
+                opponent_targets = [str(i) for i in range(9, 16)]
+            else:
+                opponent_targets = [str(i) for i in range(1, 8)]
+            
+            # 首球接触对方球
+            if first_contact in opponent_targets:
+                is_foul = True
+                penalty = -80  # 首球犯规
+            
+            # 首球接触黑八（但目标不是黑八）
+            elif first_contact == '8' and target_id != '8':
+                is_foul = True
+                penalty = -120  # 首球碰黑八更严重
+        
+        # 8. 未碰库
+        if not is_foul and not new_pocketed and not (cue_hit_cushion or target_hit_cushion):
             is_foul = True
             penalty = -30
         
@@ -1167,380 +1415,58 @@ class NewAgent(Agent):
     
     def _evaluate_position(self, cue_pos, my_targets, balls_after, table):
         """
-        评估白球停点的质量
+        评估白球停点的质量 (重构版 - 复用通用评分函数)
         
         评估维度:
-        1. 对剩余目标球的可打性（调用几何求解器）
+        1. 基于距离+角度的精细走位评分 (调用 score_position)
         2. 贴库惩罚
         3. 中心区域奖励
         
         返回:
             float: 走位分数 (大约 0-100)
         """
-        score = 50  # 基础分
         R = 0.028575
         
-        # 1. 检查对每个剩余目标球的可打性
+        # 确保 cue_pos 是 3D
+        if len(cue_pos) == 2:
+            cue_pos = np.array([cue_pos[0], cue_pos[1], 0])
+        
+        # 1. 计算剩余目标球
         remaining = [t for t in my_targets if t in balls_after and balls_after[t].state.s != 4]
         if not remaining:
             remaining = ['8']  # 清台后打黑8
         
-        # 构造虚拟白球
-        virtual_cue = VirtualBall('cue', cue_pos, R)
+        # 2. 使用通用走位评分函数 (0-50 分)
+        base_score = score_position(cue_pos, remaining, balls_after, table)
         
-        # 计算下一杆的可行解数量
-        total_solutions = 0
-        for target_id in remaining[:3]:  # 只检查前3个目标（效率）
-            if target_id not in balls_after:
-                continue
-            target_ball = balls_after[target_id]
-            if target_ball.state.s == 4:
-                continue
-                
-            for pocket_id, pocket in table.pockets.items():
-                solutions = self.solve_shot_parameters(
-                    virtual_cue, target_ball, pocket, balls_after, table
-                )
-                total_solutions += len(solutions)
-        
-        # 方案越多，走位越好
-        score += min(total_solutions * 10, 40)  # 上限 40 分
-        
-        # 2. 贴库惩罚
+        # 3. 贴库惩罚
         dist_to_rail = min(
             cue_pos[0] - R, table.w - R - cue_pos[0],
             cue_pos[1] - R, table.l - R - cue_pos[1]
         )
+        rail_penalty = 0
         if dist_to_rail < 0.03:  # 3cm 内算贴库
-            score -= 30
+            rail_penalty = -25
         elif dist_to_rail < 0.08:  # 8cm 内轻微惩罚
-            score -= 12
+            rail_penalty = -10
         
-        # 3. 中心区域奖励（便于任意方向出杆）
+        # 4. 中心区域奖励（便于任意方向出杆）
         center = np.array([table.w / 2, table.l / 2, 0])
         dist_to_center = np.linalg.norm(cue_pos - center)
         max_dist = np.sqrt((table.w / 2) ** 2 + (table.l / 2) ** 2)
+        center_bonus = 0
         if dist_to_center < max_dist * 0.3:
-            score += 20
+            center_bonus = 15
         elif dist_to_center < max_dist * 0.5:
-            score += 5
+            center_bonus = 5
         
-        return score
+        # 总分 = 基础分 + 贴库惩罚 + 中心奖励
+        # 基础分 0-50，贴库惩罚 -25~0，中心奖励 0~15，总分范围约 -25 ~ 65
+        # 为了与旧版兼容（0-100范围），加一个偏移
+        total_score = base_score + rail_penalty + center_bonus + 25  # 偏移使范围约 0-90
+        
+        return max(0, total_score)  # 确保非负
 
-    # ==================== 防守评估 ====================
-    
-    def evaluate_defense_options(self, balls, my_targets, opp_targets, table):
-        """
-        评估防守方案 (重构版 - 多次模拟验证)
-        
-        核心改进:
-        1. [修复] 遍历所有己方目标球寻找防守机会，而不仅是第一个
-        2. 多次模拟验证防守方案的可靠性
-        3. 检测是否会意外碰到/打进黑8
-        4. 更保守的对手威胁评估
-        """
-        cue_ball = balls['cue']
-        
-        # [修复] 遍历所有合法的己方目标球
-        valid_targets = [tid for tid in my_targets if tid in balls and balls[tid].state.s != 4]
-        
-        if not valid_targets:
-            # 如果没有指定目标（或者都进袋了剩下黑8），确保包含黑8
-            if '8' in balls and balls['8'].state.s != 4:
-                valid_targets = ['8']
-            else:
-                return []
-        
-        # 收集所有球的防守方案
-        all_defense_solutions = []
-        
-        # print(f"  [防守求解] 正在针对 {len(valid_targets)} 个目标球寻找防守方案...")
-        
-        for target_id in valid_targets:
-            target_ball = balls[target_id]
-            
-            # 获取该目标球的防守方案
-            solutions = self.solve_defense_parameters(
-                cue_ball, target_ball, balls, table, opp_targets
-            )
-            
-            # 标记 target_id
-            for sol in solutions:
-                sol['target_id'] = target_id
-                all_defense_solutions.append(sol)
-        
-        # 按启发式分数排序
-        all_defense_solutions.sort(key=lambda x: x['score'], reverse=True)
-        
-        # 只评估前8个高分方案
-        top_defenses = all_defense_solutions[:8]
-        print(f"  [防守求解] 共找到 {len(all_defense_solutions)} 个防守方案，评估前 {len(top_defenses)} 个")
-        
-        scored_defenses = []
-        NUM_DEFENSE_SIMS = 5  # 每个防守方案模拟次数
-        
-        for idx, sol in enumerate(top_defenses):
-            action = {
-                'V0': sol.get('V0', self.default_v0),
-                'phi': sol['phi'],
-                'theta': 0,
-                'a': 0,
-                'b': 0
-            }
-            
-            # 获取该方案对应的目标球ID（用于模拟时的犯规判定）
-            current_target_id = sol.get('target_id', valid_targets[0])
-            
-            # ==================== 多次模拟验证 ====================
-            foul_count = 0
-            eight_pocketed_count = 0
-            valid_sim_count = 0
-            cue_positions = []
-            
-            for sim_i in range(NUM_DEFENSE_SIMS):
-                # 添加噪声
-                noisy_action = self._add_noise(action)
-                
-                # 模拟
-                sim_result = self._simulate_defense_once(noisy_action, balls, table, current_target_id, my_targets)
-                
-                if sim_result['is_foul']:
-                    foul_count += 1
-                    foul_reason = sim_result.get('foul_reason', '')
-                    # 检查是否是黑8相关犯规
-                    if '黑8' in foul_reason:
-                        eight_pocketed_count += 1
-                else:
-                    valid_sim_count += 1
-                    cue_positions.append(sim_result['cue_final_pos'])
-            
-            foul_rate = foul_count / NUM_DEFENSE_SIMS
-            eight_risk = eight_pocketed_count / NUM_DEFENSE_SIMS
-            
-            # 如果有黑8风险，直接淘汰
-            if eight_risk > 0:
-                scored_defenses.append({
-                    'action': action,
-                    'defense_score': -500,  # 极低分，避免选中
-                    'strategy': sol.get('strategy', 'Unknown'),
-                    'reason': f'黑8风险({eight_risk:.0%})'
-                })
-                print(f"    [防守{idx+1}] {sol.get('strategy', 'Unknown')} (打{current_target_id}) | ⚠️ 黑8风险={eight_risk:.0%} | 直接淘汰!")
-                continue
-            
-            # 如果犯规率太高，惩罚
-            if foul_rate >= 0.6:
-                scored_defenses.append({
-                    'action': action,
-                    'defense_score': -100,
-                    'strategy': sol.get('strategy', 'Unknown'),
-                    'reason': f'犯规率过高({foul_rate:.0%})'
-                })
-                print(f"    [防守{idx+1}] {sol.get('strategy', 'Unknown')} (打{current_target_id}) | 犯规率={foul_rate:.0%} | 得分=-100")
-                continue
-            
-            # 使用模拟后的平均白球位置
-            if cue_positions:
-                avg_cue_pos = np.mean(cue_positions, axis=0)
-            else:
-                # 没有有效模拟，用最后一次的位置
-                sim_result = self._simulate_defense_once(action, balls, table, current_target_id, my_targets)
-                avg_cue_pos = sim_result['cue_final_pos']
-            
-            # 获取模拟后的球状态（用于对手评估）
-            final_sim = self._simulate_defense_once(action, balls, table, current_target_id, my_targets)
-            balls_after = final_sim['balls_after']
-            
-            # ==================== 保守的对手评估 ====================
-            # 只统计对手最好的几个直球方案（切角小的）
-            opp_best_shots = []
-            
-            for opp_id in opp_targets:
-                if opp_id in balls_after and balls_after[opp_id].state.s != 4:
-                    opp_target = balls_after[opp_id]
-                    for pid, pkt in table.pockets.items():
-                        opp_sols = self.solve_shot_parameters(balls_after['cue'], opp_target, pkt, balls_after, table)
-                        
-                        for s in opp_sols:
-                            if s.get('type') == 'Direct':
-                                cut_angle = s.get('cut_angle', 90)
-                                if cut_angle < 70:  # 只考虑切角<70的直球
-                                    opp_best_shots.append({
-                                        'target': opp_id,
-                                        'pocket': pid,
-                                        'cut_angle': cut_angle
-                                    })
-            
-            # 按切角排序，取最佳的3个
-            opp_best_shots.sort(key=lambda x: x['cut_angle'])
-            top_opp_shots = opp_best_shots[:3]
-            
-            # 评分逻辑：根据对手最佳机会的质量打分
-            if len(top_opp_shots) == 0:
-                defense_score = 80  # 没有直球机会，较好
-            else:
-                best_cut = top_opp_shots[0]['cut_angle']
-                # 对手最佳切角越大，防守越成功
-                if best_cut > 60:
-                    defense_score = 60  # 对手只有大角度球
-                elif best_cut > 45:
-                    defense_score = 40  # 对手有中等角度球
-                elif best_cut > 30:
-                    defense_score = 20  # 对手有较好的球
-                else:
-                    defense_score = 0   # 对手有直球，防守失败
-                
-                # 根据可选方案数量调整
-                defense_score -= len(top_opp_shots) * 5
-            
-            # [优化] 加入对手反击难度评分
-            # 如果对手有球打，但是距离很远(>1.0m)，稍微加点分
-            if len(top_opp_shots) > 0:
-                min_opp_dist = float('inf')
-                for opp_id in opp_targets:
-                    if opp_id in balls_after and balls_after[opp_id].state.s != 4:
-                         d = np.linalg.norm(avg_cue_pos - balls_after[opp_id].state.rvw[0])
-                         if d < min_opp_dist: min_opp_dist = d
-                if min_opp_dist > 1.0:
-                    defense_score += 8 # 远台防守加分
-            
-            # 加入启发式预评分
-            defense_score += sol.get('score', 0) * 0.2
-            
-            scored_defenses.append({
-                'action': action,
-                'defense_score': defense_score,
-                'strategy': sol.get('strategy', 'Unknown'),
-                'predicted_stop': avg_cue_pos,
-                'foul_rate': foul_rate,
-                'opp_best_cut': top_opp_shots[0]['cut_angle'] if top_opp_shots else 999,
-                'opp_options': len(top_opp_shots),
-                'power_level': sol.get('power_level', 'N/A')
-            })
-            
-            opp_info = f"最佳切角={top_opp_shots[0]['cut_angle']:.0f}°" if top_opp_shots else "无直球"
-            print(f"    [防守{idx+1}] {sol.get('strategy', 'Unknown')} | 力度={sol.get('power_level', 'N/A')}({action['V0']:.1f}) "
-                  f"| 犯规率={foul_rate:.0%} | 对手: {opp_info}, {len(top_opp_shots)}个方案 | 得分={defense_score:.1f}")
-        
-        # 按分数排序
-        scored_defenses.sort(key=lambda x: -x['defense_score'])
-        return scored_defenses
-
-    def _simulate_defense_once(self, action, balls, table, legal_target_id, my_targets=None):
-        """
-        模拟一次防守击球（完善犯规检测）
-        
-        参数:
-            action: 击球动作参数
-            balls: 当前球状态
-            table: 球桌对象
-            legal_target_id: 合法的首球接触目标
-            my_targets: 我方所有目标球列表（用于验证首球接触合法性）
-        
-        返回:
-            dict: {
-                'is_foul': 是否犯规,
-                'foul_reason': 犯规原因（如有）,
-                'cue_final_pos': 白球最终位置,
-                'balls_after': 模拟后的球状态
-            }
-        """
-        if my_targets is None:
-            my_targets = [legal_target_id]
-        
-        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        sim_table = copy.deepcopy(table)
-        cue = pt.Cue(cue_ball_id="cue")
-        
-        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-        shot.cue.set_state(**action)
-        pt.simulate(shot, inplace=True)
-        
-        # ==================== 分析结果 ====================
-        
-        # 1. 进袋分析
-        new_pocketed = [
-            bid for bid, b in shot.balls.items() 
-            if b.state.s == 4 and sim_balls[bid].state.s != 4
-        ]
-        cue_pocketed = 'cue' in new_pocketed
-        eight_pocketed = '8' in new_pocketed
-        
-        # 2. 事件分析
-        first_contact = None
-        cue_hit_cushion = False
-        any_ball_hit_cushion = False
-        
-        valid_ball_ids = {str(i) for i in range(1, 16)}  # '1'-'15'
-        
-        for e in shot.events:
-            et = str(e.event_type).lower()
-            ids = list(e.ids) if hasattr(e, 'ids') else []
-            
-            # 首球接触检测
-            if first_contact is None and 'cushion' not in et and 'pocket' not in et and 'cue' in ids:
-                other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
-                if other_ids:
-                    first_contact = other_ids[0]
-            
-            # 碰库检测
-            if 'cushion' in et:
-                if 'cue' in ids:
-                    cue_hit_cushion = True
-                # 检查是否有任何球碰库
-                for ball_id in ids:
-                    if ball_id in valid_ball_ids or ball_id == 'cue':
-                        any_ball_hit_cushion = True
-        
-        # ==================== 犯规判定 ====================
-        is_foul = False
-        foul_reason = None
-        
-        # 检查是否还有其他自己的球（判断是否可以打黑8）
-        remaining_own = [t for t in my_targets if t != '8' and sim_balls.get(t) and sim_balls[t].state.s != 4]
-        can_shoot_eight = len(remaining_own) == 0
-        
-        # 犯规1: 白球落袋
-        if cue_pocketed:
-            is_foul = True
-            foul_reason = "白球落袋"
-        
-        # 犯规2: 空杆（未击中任何球）
-        elif first_contact is None:
-            is_foul = True
-            foul_reason = "空杆(未击中任何球)"
-        
-        # 犯规3: 首球接触非法（必须先碰自己的球）
-        elif first_contact not in my_targets:
-            is_foul = True
-            foul_reason = f"首球接触非法(先碰{first_contact}，应碰{my_targets})"
-        
-        # 犯规4: 无碰库犯规（无进球且无球碰库）
-        elif len(new_pocketed) == 0 and not any_ball_hit_cushion:
-            is_foul = True
-            foul_reason = "无碰库(无进球且无球碰库)"
-        
-        # 犯规5: 黑8意外落袋（未清台）
-        elif eight_pocketed and not can_shoot_eight:
-            is_foul = True
-            foul_reason = "黑8意外落袋(未清台)"
-        
-        # 犯规6: 打黑8时同时落袋
-        elif eight_pocketed and cue_pocketed:
-            is_foul = True
-            foul_reason = "黑8和白球同时落袋"
-        
-        # 白球最终位置
-        cue_final_pos = shot.balls['cue'].state.rvw[0].copy()
-        
-        return {
-            'is_foul': is_foul,
-            'foul_reason': foul_reason,
-            'cue_final_pos': cue_final_pos,
-            'balls_after': shot.balls,
-            'first_contact': first_contact,
-            'pocketed': new_pocketed
-        }
 
     @staticmethod
     def get_mirror(point, rail):
@@ -1842,524 +1768,6 @@ class NewAgent(Agent):
 
         return solutions
 
-    def solve_runout_parameters(self, cue_ball, target_ball, next_target_ball, balls, table, opponent_targets=None):
-        """
-        [Member B] 进攻走位求解器 (Run-out Solver)
-        
-        功能：
-            在打进当前球(target_ball)的基础上，寻找最佳走位，以便进攻下一颗球(next_target_ball)。
-            如果无法进攻，则尝试防守 (调用 solve_defense_parameters)。
-            
-        参数：
-            cue_ball: 白球
-            target_ball: 当前目标球
-            next_target_ball: 下一颗目标球 (Ball对象) 或 None
-            balls: 所有球状态
-            table: 球桌对象
-            opponent_targets: 对手目标球ID列表 (用于防守计算)
-            
-        返回：
-            list: 包含评分的击球方案, 按推荐程度排序
-        """
-        if balls is None or table is None: return []
-        
-        pockets = table.pockets
-        candidates = []
-        R = cue_ball.params.R
-        
-        # 1. 获取当前球的所有进球方案
-        for pocket_id, pocket in pockets.items():
-            shots = self.solve_shot_parameters(cue_ball, target_ball, pocket, balls, table)
-            for shot in shots:
-                shot['pocket_id'] = pocket_id
-                candidates.append(shot)
-        
-        # 2. 如果没有进球方案，转入防守模式
-        if not candidates:
-            # print("[Run-out] 无进攻机会，切换至防守模式...")
-            defense_solutions = self.solve_defense_parameters(cue_ball, target_ball, balls, table, opponent_targets)
-            # 统一格式返回
-            return defense_solutions
-            
-        # 3. 评估走位 (Run-out Logic)
-        scored_candidates = []
-        
-        for shot in candidates:
-            # --- 基础分：进球难度 ---
-            # 直球最稳，Kick/Bank 风险大
-            base_score = 100
-            if shot['type'] == 'Bank': base_score -= 30
-            elif 'Kick' in shot['type']: base_score -= 40
-            
-            # 切角过大容易失误
-            if shot['cut_angle'] > 60: base_score -= (shot['cut_angle'] - 60)
-            
-            # --- 走位分：为下一杆做准备 ---
-            position_score = 0
-            predicted_stop_pos = None
-            
-            if next_target_ball:
-                # 计算切线方向 (Tangent Line) - 假设定杆(Stun)
-                # u_out = u_arrival - (u_arrival . u_target_out) * u_target_out
-                u_arr = shot['u_arrival']
-                u_tgt = shot['u_target_out']
-                dot = np.dot(u_arr, u_tgt)
-                u_out_vec = u_arr - dot * u_tgt
-                
-                # 归一化分离方向
-                norm_out = np.linalg.norm(u_out_vec)
-                if norm_out < 1e-6:
-                    u_out = np.zeros(3) # 正面撞击，停在原地
-                else:
-                    u_out = u_out_vec / norm_out
-                
-                # 寻找切线上最佳停点
-                # 假设白球能在切线方向滚动 0.2m ~ 1.5m
-                # 我们采样几个点，看哪个点对 next_target 最好
-                best_spot_score = -float('inf')
-                best_spot = None
-                
-                ghost_pos = shot['ghost']
-                
-                # 采样距离: 0 (Stop), 0.3, 0.6, 0.9, 1.2 (Follow/Draw adjusted tangent)
-                # 注意：纯定杆只能沿切线。推杆/拉杆会偏离切线。
-                # 这里简化模型：只考虑切线上的点 (对于大角度切球，切线是主要分量)
-                
-                for dist in [0.0, 0.3, 0.6, 0.9, 1.2]:
-                    stop_pos = ghost_pos + u_out * dist
-                    
-                    # 检查是否出界
-                    if not (R < stop_pos[0] < table.w - R and R < stop_pos[1] < table.l - R):
-                        continue
-                    
-                    # [NEW] 模拟下一杆，计算可行解数量
-                    next_shot_count = 0
-                    if next_target_ball:
-                        sim_balls = balls.copy()
-                        sim_balls['cue'] = VirtualBall('cue', stop_pos, R)
-                        # 移除已打进的目标球
-                        if target_ball.id in sim_balls:
-                            del sim_balls[target_ball.id]
-                        
-                        if next_target_ball.id in sim_balls:
-                            sim_next_target = sim_balls[next_target_ball.id]
-                            for pid, pkt in pockets.items():
-                                 # 调用求解器计算下一杆的可行解
-                                 next_sols = self.solve_shot_parameters(sim_balls['cue'], sim_next_target, pkt, sim_balls, table)
-                                 next_shot_count += len(next_sols)
-                        
-                    # [NEW] 基于解数量的评分
-                    # 解越多，走位越好。
-                    simulation_score = next_shot_count * 5
-                    
-                    # A. 是否可见 (Clear Path) - 保留作为快速过滤
-                    next_pos = next_target_ball.state.rvw[0]
-                    
-                    # 关键修正：检查下一杆时，当前目标球(target_ball)已经被打进，所以应排除
-                    # 同时也要排除下一颗球(next_target_ball)自己，因为它在路径终点，会被视为障碍
-                    if not self.is_segment_clear_static(stop_pos, next_pos, balls, exclude_ids=[cue_ball.id, target_ball.id, next_target_ball.id]):
-                        spot_score = -100 # 被阻挡
-                    else:
-                        spot_score = simulation_score # 使用模拟分作为基础
-                        
-                        # B. 距离适中 (太远难打，太近不好运杆)
-                        d_next = np.linalg.norm(next_pos - stop_pos)
-                        if d_next < 0.3: spot_score -= 20 # 太近
-                        elif d_next > 1.5: spot_score -= (d_next - 1.5) * 10 # 太远
-                        else: spot_score += 20 # 舒适区
-                        
-                        # C. 进球角度 (Next Cut Angle) - 保留作为质量补充
-                        best_pocket_angle_score = -50
-                        for pid, pkt in pockets.items():
-                            # 检查 Next -> Pocket 是否通畅 (同样排除当前目标球)
-                            if self.is_segment_clear_static(next_pos, pkt.center, balls, exclude_ids=[cue_ball.id, next_target_ball.id, target_ball.id]):
-                                # 计算 Next Cut Angle
-                                vec_np = pkt.center - next_pos
-                                vec_np[2] = 0
-                                u_np = vec_np / np.linalg.norm(vec_np)
-                                
-                                vec_cn = next_pos - stop_pos
-                                vec_cn[2] = 0
-                                dist_cn = np.linalg.norm(vec_cn)
-                                if dist_cn > 1e-6:
-                                    u_cn = vec_cn / dist_cn
-                                    # Cut Angle
-                                    angle = np.degrees(np.arccos(np.clip(np.dot(u_cn, u_np), -1, 1)))
-                                    
-                                    # 理想角度：15~45度 (方便再次走位)，直球也可以但走位稍难
-                                    # 0~60度是可接受范围
-                                    if angle > 70: s = -50
-                                    elif angle > 50: s = 10
-                                    elif angle < 10: s = 30
-                                    else: s = 50 # 10-50度 最佳
-                                    
-                                    if s > best_pocket_angle_score:
-                                        best_pocket_angle_score = s
-                        
-                        spot_score += best_pocket_angle_score
-                    
-                    if spot_score > best_spot_score:
-                        best_spot_score = spot_score
-                        best_spot = stop_pos
-                
-                if best_spot is not None:
-                    position_score = best_spot_score
-                    predicted_stop_pos = best_spot
-                else:
-                    position_score = -50 # 无法停在好位置
-            else:
-                # 如果没有下一颗球，只求打进，且白球不洗袋
-                position_score = 0
-                predicted_stop_pos = shot['ghost'] # 粗略
-            
-            # 总分
-            shot['score'] = base_score + position_score
-            shot['predicted_stop_pos'] = predicted_stop_pos
-            scored_candidates.append(shot)
-            
-        # 排序
-        scored_candidates.sort(key=lambda x: x['score'], reverse=True)
-        return scored_candidates
-
-    def trace_ray_with_rebound(self, start_pos, direction_u, distance, table_w, table_l, R):
-        """
-        Simulate a rolling ball path with wall rebounds.
-        Returns:
-            final_pos (np.array): The stop position.
-            path_points (list of np.array): The list of vertices (start, bounce1, bounce2, ..., end).
-        """
-        pos = start_pos.copy()
-        u = direction_u.copy()
-        remaining_dist = distance
-        path = [pos.copy()]
-        
-        # Max rebounds to prevent infinite loops (though distance limits it naturally)
-        for _ in range(5):
-            if remaining_dist <= 1e-4: break
-            
-            # 1. Find collision time to each wall
-            # Walls: x=R, x=W-R, y=R, y=L-R
-            # To handle cushion compression or physics radius, we use R.
-            
-            t_min = float('inf')
-            wall_idx = -1 # 0:Left, 1:Right, 2:Bottom, 3:Top
-            
-            # Left (x=R)
-            if u[0] < -1e-6:
-                t = (R - pos[0]) / u[0]
-                if 0 <= t < t_min: t_min = t; wall_idx = 0
-            # Right (x=W-R)
-            elif u[0] > 1e-6:
-                t = (table_w - R - pos[0]) / u[0]
-                if 0 <= t < t_min: t_min = t; wall_idx = 1
-            
-            # Bottom (y=R)
-            if u[1] < -1e-6:
-                t = (R - pos[1]) / u[1]
-                if 0 <= t < t_min: t_min = t; wall_idx = 2
-            # Top (y=L-R)
-            elif u[1] > 1e-6:
-                t = (table_l - R - pos[1]) / u[1]
-                if 0 <= t < t_min: t_min = t; wall_idx = 3
-                
-            # Check if we stop before hitting wall
-            if remaining_dist <= t_min:
-                pos = pos + u * remaining_dist
-                path.append(pos.copy())
-                break
-            else:
-                # Hit wall
-                pos = pos + u * t_min
-                path.append(pos.copy())
-                remaining_dist -= t_min
-                
-                # Reflect
-                if wall_idx == 0 or wall_idx == 1: # Left/Right -> Reflect X
-                    u[0] = -u[0]
-                elif wall_idx == 2 or wall_idx == 3: # Top/Bottom -> Reflect Y
-                    u[1] = -u[1]
-                
-                # Energy loss on cushion? (Optional)
-                # remaining_dist *= 0.8
-        
-        return pos, path
-
-    def solve_defense_parameters(self, cue_ball, target_ball, balls, table, opponent_targets=None):
-        """
-        [Member B 实现] 防守求解器
-        
-        功能：
-            寻找防守击球方案，使白球停在安全位置（制造障碍或远台）。
-            
-        参数：
-            cue_ball: 白球对象
-            target_ball: 我方必须击打的球（合法目标）
-            balls: 所有球状态
-            table: 球桌对象
-            opponent_targets: 对手目标球ID列表 (用于评估Snooker效果)
-            
-        返回：
-            list: [{'phi': float, 'V0': float, 'type': 'Safety', 'score': float, 'strategy': str}]
-        """
-        if balls is None or table is None: return []
-        
-        solutions = []
-        R = cue_ball.params.R
-        cue_pos = cue_ball.state.rvw[0]
-        target_pos = target_ball.state.rvw[0]
-        
-        # 1. 尝试 Direct Hit 防守
-        direct_possible = self.is_path_clear(cue_ball, target_ball, None, balls)
-        
-        if direct_possible:
-            vec_ct = target_pos - cue_pos
-            vec_ct[2] = 0
-            dist_ct = np.linalg.norm(vec_ct)
-            u_ct = vec_ct / dist_ct
-            angle_ct = np.degrees(np.arctan2(u_ct[1], u_ct[0]))
-            
-            # 搜索：不同的切角 和 不同的力度
-            # 切角
-            for cut_angle in range(-80, 81, 5): # 略微减小范围，避免85度过于极限
-                check_angle = angle_ct + 180 + cut_angle 
-                ghost_u = np.array([np.cos(np.radians(check_angle)), np.sin(np.radians(check_angle)), 0])
-                ghost_pos = target_pos + ghost_u * (2 * R)
-                
-                # Check if Ghost Position is physically valid (on table)
-                if not (R - 1e-4 <= ghost_pos[0] <= table.w - R + 1e-4 and 
-                        R - 1e-4 <= ghost_pos[1] <= table.l - R + 1e-4):
-                    continue
-
-                # 检查白球能否直达该 Ghost
-                if not self.is_segment_clear_static(cue_pos, ghost_pos, balls, exclude_ids=[cue_ball.id, target_ball.id]):
-                    continue
-                
-                # 计算出射方向
-                vec_cg = ghost_pos - cue_pos
-                vec_cg[2] = 0
-                dist_cg = np.linalg.norm(vec_cg)
-                u_cg = vec_cg / dist_cg
-                phi = np.degrees(np.arctan2(u_cg[1], u_cg[0])) % 360
-                
-                u_n = -ghost_u
-                dot = np.dot(u_cg, u_n)
-                u_out_vec = u_cg - dot * u_n
-                norm_out = np.linalg.norm(u_out_vec)
-                u_out = u_out_vec / norm_out if norm_out > 1e-6 else np.zeros(3)
-                
-                # ==================== 多档力度防守 ====================
-                # 使用4档力度系统替代滚动距离估算 (移除very_hard)
-                # 力度对应大致的滚动距离：very_soft~0.5m, soft~1.0m, medium~1.5m, hard~2.0m
-                roll_dist_mapping = {
-                    'very_soft': 0.5,
-                    'soft': 1.0,
-                    'medium': 1.5,
-                    'hard': 2.0
-                }
-                
-                for power_name in self.power_names:
-                    v0 = self.power_levels[power_name]
-                    roll_dist = roll_dist_mapping[power_name]
-                    
-                    pred_stop_pos, roll_path = self.trace_ray_with_rebound(ghost_pos, u_out, roll_dist, table.w, table.l, R)
-                    
-                    # 检查滚动路径是否与其他球碰撞
-                    path_collision = False
-                    for i in range(len(roll_path) - 1):
-                        if not self.is_segment_clear_static(roll_path[i], roll_path[i+1], balls, exclude_ids=[cue_ball.id, target_ball.id]):
-                            path_collision = True
-                            break
-                    if path_collision:
-                        continue
-
-                    # 检查最终停点是否与其他球重叠
-                    valid_stop = True
-                    for bid, b in balls.items():
-                        if bid == 'cue':
-                            continue
-                        if np.linalg.norm(pred_stop_pos - b.state.rvw[0]) < 2*R:
-                            valid_stop = False
-                            break
-                    if not valid_stop:
-                        continue
-
-                    # 评分
-                    score = 0
-                    if opponent_targets:
-                        # 距离对手越远越好
-                        min_dist = float('inf')
-                        for opp_id in opponent_targets:
-                            if opp_id in balls:
-                                d = np.linalg.norm(pred_stop_pos - balls[opp_id].state.rvw[0])
-                                if d < min_dist:
-                                    min_dist = d
-                        score += min_dist * 10
-                        
-                        # Snooker奖励
-                        snookered = 0
-                        for opp_id in opponent_targets:
-                            if opp_id in balls:
-                                if not self.is_segment_clear_static(pred_stop_pos, balls[opp_id].state.rvw[0], balls, exclude_ids=[opp_id, target_ball.id]):
-                                    snookered += 1
-                        score += snookered * 50
-                    
-                    # 贴库奖励
-                    dist_to_rail = min(pred_stop_pos[0]-R, table.w-R-pred_stop_pos[0], pred_stop_pos[1]-R, table.l-R-pred_stop_pos[1])
-                    if dist_to_rail < 1.5 * R:
-                        score += 30
-                    
-                    # 力度评分调整：防守偏好中等力度（更可控）
-                    power_score_adj = {
-                        'very_soft': 5,    # 极小力防守更安全
-                        'soft': 10,        # 小力防守最佳
-                        'medium': 5,       # 中力可以
-                        'hard': -5,        # 大力风险较高
-                        'very_hard': -15   # 极大力防守风险很高
-                    }
-                    score += power_score_adj.get(power_name, 0)
-                    
-                    if score > 10:  # 降低阈值，生成更多候选
-                        solutions.append({
-                            'type': 'Safety',
-                            'phi': phi,
-                            'V0': v0,
-                            'score': score,
-                            'strategy': 'Direct-Safety',
-                            'cut_angle': abs(cut_angle),
-                            'ghost': ghost_pos,
-                            'predicted_stop_pos': pred_stop_pos,
-                            'roll_dist': roll_dist,
-                            'roll_path': roll_path,
-                            'power_level': power_name
-                        })
-
-        # 2. 增强版 Kick Safety (支持 1-2 库)
-        max_safety_cushions = 2
-        
-        import itertools 
-        
-        # Define rails locally
-        rails = [
-            {'name': 'left',   'val': 0,       'axis': 0, 'limit': (0, table.l)},
-            {'name': 'right',  'val': table.w, 'axis': 0, 'limit': (0, table.l)},
-            {'name': 'bottom', 'val': 0,       'axis': 1, 'limit': (0, table.w)},
-            {'name': 'top',    'val': table.l, 'axis': 1, 'limit': (0, table.w)}
-        ]
-        
-        for n in range(1, max_safety_cushions + 1):
-            all_seqs = []
-            for seq in itertools.product(rails, repeat=n):
-                valid = True
-                for i in range(len(seq)-1):
-                    if seq[i]['name'] == seq[i+1]['name']: valid = False; break
-                if valid: all_seqs.append(seq)
-            
-            for seq in all_seqs:
-                # Target is just a point we want to HIT.
-                # Use get_cushion_path
-                path_points = self.get_cushion_path(cue_pos, target_pos, seq)
-                if path_points:
-                    # Check clearance
-                    path_clear = True
-                    for i in range(len(path_points)-1):
-                        p1, p2 = path_points[i], path_points[i+1]
-                        # For safety, we just want to reach target ball.
-                        # Exclude target from obstacles (it's the goal).
-                        # Exclude cue from obstacles.
-                        # [Modified] Add safety margin to avoid visual overlap or physics edge cases
-                        if not self.is_segment_clear_static(p1, p2, balls, exclude_ids=[cue_ball.id, target_ball.id], margin=0.015):
-                            path_clear = False; break
-                    
-                    if path_clear:
-                        # Found a path!
-                        p1 = path_points[1]
-                        vec_shot = p1 - cue_pos
-                        phi = np.degrees(np.arctan2(vec_shot[1], vec_shot[0])) % 360
-                        
-                        # Score
-                        score = 40 + n * 10 # More cushions = harder but cooler/more unexpected
-                        
-                        # Snooker bonus?
-                        # Assume stop at target (rough estimate)
-                        # Kick Safety 通常很难控制停点，但如果我们要给用户信心，
-                        # 我们假设它停在 Target 附近 (撞击后动能损失大)
-                        pred_stop_pos = target_pos
-                        
-                        # [NEW] 模拟评估 (Kick Safety)
-                        # ... (Same logic as before) ...
-                        opp_virtual_cue = VirtualBall('cue', pred_stop_pos, R)
-                        opp_shot_count = 0
-                        if opponent_targets:
-                            sim_balls = balls.copy()
-                            sim_balls['cue'] = opp_virtual_cue
-                            
-                            for opp_target_id in opponent_targets:
-                                if opp_target_id in sim_balls:
-                                    opp_target = sim_balls[opp_target_id]
-                                    for pid, pkt in table.pockets.items():
-                                        opp_sols = self.solve_shot_parameters(opp_virtual_cue, opp_target, pkt, sim_balls, table)
-                                        opp_shot_count += len(opp_sols)
-                        
-                        # 评分：对手解越少，分数越高
-                        if opp_shot_count == 0:
-                            score += 200 # Absolute Snooker
-                        else:
-                            score += max(0, 100 - opp_shot_count * 5)
-                            
-                        # 原有的 heuristic 也可以保留作为补充
-                        if opponent_targets:
-                            snookered = 0
-                            for opp_id in opponent_targets:
-                                if opp_id in balls:
-                                    if not self.is_segment_clear_static(pred_stop_pos, balls[opp_id].state.rvw[0], balls, exclude_ids=[opp_id]):
-                                        snookered += 1
-                            score += snookered * 20
-                            
-                        # ==================== Kick-Safety 多档力度 ====================
-                        # 计算路径总长度
-                        path_total_dist = sum(
-                            np.linalg.norm(path_points[i+1] - path_points[i])
-                            for i in range(len(path_points) - 1)
-                        )
-                        
-                        # 根据路径长度和库数选择合适的力度范围
-                        if path_total_dist < 1.0:
-                            kick_powers = ['soft', 'medium']
-                        elif path_total_dist < 1.8:
-                            kick_powers = ['medium', 'hard']
-                        else:
-                            kick_powers = ['hard']
-                        
-                        # 多库需要额外增加力度 (最大到 hard)
-                        if n >= 2:
-                            power_upgrade = {'soft': 'medium', 'medium': 'hard', 'hard': 'hard'}
-                            kick_powers = list(set(power_upgrade.get(p, p) for p in kick_powers))
-                        
-                        for kick_power in kick_powers:
-                            v0_kick = self.power_levels[kick_power]
-                            
-                            # 力度评分调整
-                            power_adj = {'soft': 5, 'medium': 10, 'hard': 5}
-                            adjusted_score = score + power_adj.get(kick_power, 0)
-                            
-                            solutions.append({
-                                'type': 'Safety',
-                                'phi': phi,
-                                'V0': v0_kick,
-                                'score': adjusted_score,
-                                'strategy': f'{n}-Rail-Kick-Safety',
-                                'cut_angle': 0,
-                                'ghost': target_pos,
-                                'predicted_stop_pos': pred_stop_pos,
-                                'cue_seq': [r['name'] for r in seq],
-                                'power_level': kick_power,
-                                'path_dist': path_total_dist
-                            })
-        
-        # 按分数排序
-        solutions.sort(key=lambda x: x['score'], reverse=True)
-        return solutions # 返回所有解，由调用者决定取多少
-
     def is_segment_clear_static(self, p1, p2, balls, exclude_ids=[], margin=0.0):
         """静态方法的路径检测，方便内部调用"""
         vec = p2 - p1
@@ -2386,5 +1794,3 @@ class NewAgent(Agent):
                 return False
         return True
 
-    def is_path_clear(self, cue_ball, target_ball, pocket, balls):
-        return self.is_segment_clear_static(cue_ball.state.rvw[0], target_ball.state.rvw[0], balls, [cue_ball.id, target_ball.id])

@@ -877,26 +877,62 @@ class NewAgent:
         返回:
             Dict: 击球动作 {'V0', 'phi', 'theta', 'a', 'b'}
         """
+        print("\n" + "="*60)
+        print("[NewAgent] ========== DECISION START ==========")
+        print(f"[NewAgent] My targets: {my_targets}")
+        
+        # 统计场上球的状态
+        on_table = [bid for bid, b in balls.items() if b.state.s != 4 and bid != 'cue']
+        print(f"[NewAgent] Balls on table: {on_table}")
+        
+        cue_pos = balls['cue'].state.rvw[0] if 'cue' in balls else None
+        if cue_pos is not None:
+            print(f"[NewAgent] Cue ball position: ({cue_pos[0]:.3f}, {cue_pos[1]:.3f})")
+        
         # 1. 开球检测
         if self._is_break_shot(balls, table):
-            print("[NewAgent] Detected break shot situation.")
-            return self._break_shot_action(balls, table, my_targets)
+            print("[NewAgent] >>> BREAK SHOT detected!")
+            action = self._break_shot_action(balls, table, my_targets)
+            print(f"[NewAgent] Break shot action: V0={action['V0']:.2f}, phi={action['phi']:.2f}")
+            print("[NewAgent] ========== DECISION END ==========\n")
+            return action
             
         # 2. 进攻评估
-        print(f"[NewAgent] Evaluating attack options for targets: {my_targets}")
+        print("\n[NewAgent] --- Evaluating ATTACK options ---")
         best_attack_action, best_attack_score = self.attack_strategy(balls, my_targets, table)
+        
+        if best_attack_action is not None:
+            print(f"[NewAgent] Best attack score: {best_attack_score:.2f} (threshold: {self.attack_threshold})")
+            print(f"[NewAgent] Best attack action: V0={best_attack_action['V0']:.2f}, phi={best_attack_action['phi']:.2f}")
+        else:
+            print("[NewAgent] No viable attack found.")
         
         # 3. 决策逻辑
         if best_attack_action is not None and best_attack_score >= self.attack_threshold:
-            print(f"[NewAgent] Attack! Score: {best_attack_score:.2f}")
+            print(f"[NewAgent] >>> ATTACK! Score {best_attack_score:.2f} >= threshold {self.attack_threshold}")
+            print("[NewAgent] ========== DECISION END ==========\n")
             return best_attack_action
             
-        # 4. 防守策略 (暂未实现完全版，使用 Fallback)
-        print(f"[NewAgent] No good attack option (Score: {best_attack_score:.2f}). Fallback to random/defense.")
+        # 4. 防守策略
+        print("\n[NewAgent] --- Evaluating DEFENSE options ---")
+        opp_targets = self._get_opponent_targets(my_targets)
+        print(f"[NewAgent] Opponent targets: {opp_targets}")
         
-        # 简单的防守 Fallback：随机打一杆，或者轻推白球
-        # 这里暂时用随机动作替代，直到 defense_strategy 实现
-        return self._random_action()
+        best_defense_action, best_defense_score = self.defense_strategy(balls, my_targets, opp_targets, table)
+        
+        if best_defense_action is not None:
+            print(f"[NewAgent] Best defense score: {best_defense_score:.2f}")
+            print(f"[NewAgent] Best defense action: V0={best_defense_action['V0']:.2f}, phi={best_defense_action['phi']:.2f}")
+            print(f"[NewAgent] >>> DEFENSE!")
+            print("[NewAgent] ========== DECISION END ==========\n")
+            return best_defense_action
+        
+        # 5. Fallback: 随机动作
+        print("[NewAgent] >>> FALLBACK to random action!")
+        action = self._random_action()
+        print(f"[NewAgent] Random action: V0={action['V0']:.2f}, phi={action['phi']:.2f}")
+        print("[NewAgent] ========== DECISION END ==========\n")
+        return action
 
     # ========================================================================
     #                              进攻策略
@@ -938,6 +974,8 @@ class NewAgent:
         if not legal_targets:
             legal_targets = ['8']
         
+        print(f"  [Attack] Legal targets: {legal_targets}")
+        
         candidates = []
         
         # 1. 遍历所有组合，收集初步方案
@@ -968,14 +1006,21 @@ class NewAgent:
                         'solution': sol
                     })
         
+        print(f"  [Attack] Solver found {len(candidates)} candidate plans")
+        
         if not candidates:
+            print(f"  [Attack] No candidates from solver!")
             return None, -1000.0
             
         # 3. 快速筛选
         # 使用 self.quick_simulation_count (默认为3)
+        print(f"  [Attack] Quick filtering with {self.quick_simulation_count} simulations each...")
         filtered_candidates = self._quick_filter(candidates, balls, my_targets, table)
         
+        print(f"  [Attack] After quick filter: {len(filtered_candidates)} viable plans")
+        
         if not filtered_candidates:
+            print(f"  [Attack] All candidates filtered out!")
             return None, -1000.0
             
         # 4. 排序并选出 Top-K
@@ -983,17 +1028,29 @@ class NewAgent:
         filtered_candidates.sort(key=lambda x: (-x.get('quick_success_rate', 0), x['solution']['difficulty']))
         top_candidates = filtered_candidates[:self.top_k]
         
+        print(f"  [Attack] Top-{len(top_candidates)} candidates for fine evaluation:")
+        for i, cand in enumerate(top_candidates):
+            print(f"    #{i+1}: target={cand['target_id']}, pocket={cand['pocket_id']}, "
+                  f"success_rate={cand.get('quick_success_rate', 0):.2f}, "
+                  f"difficulty={cand['solution']['difficulty']:.1f}")
+        
         # 5. 精细评估
         # 使用 self.fine_simulation_count (默认为10)
+        print(f"  [Attack] Fine evaluating with {self.fine_simulation_count} simulations each...")
         final_candidates = self._fine_evaluate(top_candidates, balls, my_targets, table)
         
         if not final_candidates:
+            print(f"  [Attack] Fine evaluation failed!")
             return None, -1000.0
             
         # 6. 选择最佳方案
         # 按 total_score 降序排列
         final_candidates.sort(key=lambda x: -x['fine_result']['total_score'])
         best_option = final_candidates[0]
+        
+        print(f"  [Attack] Best plan: target={best_option['target_id']}, "
+              f"score={best_option['fine_result']['total_score']:.2f}, "
+              f"success_rate={best_option['fine_result'].get('success_rate', 0):.2f}")
         
         return best_option['action'], best_option['fine_result']['total_score']
 
@@ -1126,7 +1183,15 @@ class NewAgent:
         table: Any
     ) -> Tuple[Optional[Dict[str, float]], float]:
         """
-        防守策略
+        防守策略 - 两阶段决策
+        
+        阶段1: 强攻尝试 (Force Attack)
+            - 大力 (V0=7) + 11点角度搜索
+            - 尝试找到能进球的方案
+            
+        阶段2: 安全推进 (Safe Push)
+            - 轻推己方球到更好位置
+            - 目标球离袋口越近越好，离库边越远越好
         
         参数:
             balls: 当前球状态
@@ -1136,11 +1201,353 @@ class NewAgent:
         
         返回:
             Tuple[Optional[Dict], float]:
-                - Dict: 最佳防守动作（无可行方案时为 None）
+                - Dict: 最佳防守动作
                 - float: 方案评分
         """
-        # TODO: 后续实现防守策略
-        raise NotImplementedError
+        cue_ball = balls.get('cue')
+        if cue_ball is None:
+            print("  [Defense] ERROR: No cue ball found!")
+            return self._random_action(), -1000
+        
+        # ========== 阶段1: 强攻尝试 ==========
+        print("  [Defense] Phase 1: Force Attack...")
+        force_result = self._defense_force_attack(balls, my_targets, table)
+        if force_result is not None:
+            action, score = force_result
+            if score > 0:  # 找到可行进球方案
+                print(f"  [Defense] Force attack SUCCESS! Score: {score:.2f}")
+                return action, score
+            else:
+                print(f"  [Defense] Force attack found plan but score too low: {score:.2f}")
+        else:
+            print("  [Defense] Force attack found no plan.")
+        
+        # ========== 阶段2: 安全推进 ==========
+        print("  [Defense] Phase 2: Safe Push...")
+        push_result = self._defense_safe_push(balls, my_targets, table)
+        if push_result is not None:
+            action, score = push_result
+            print(f"  [Defense] Safe push SUCCESS! Score: {score:.2f}")
+            return push_result
+        else:
+            print("  [Defense] Safe push found no plan.")
+        
+        # Fallback: 随机动作
+        print("  [Defense] FALLBACK to random action.")
+        return self._random_action(), -100
+
+    def _defense_force_attack(
+        self,
+        balls: Dict[str, Any],
+        my_targets: List[str],
+        table: Any
+    ) -> Optional[Tuple[Dict[str, float], float]]:
+        """
+        阶段1: 强攻尝试
+        
+        流程:
+        1. 遍历所有 (目标球, 袋口, 角度偏移) 组合
+        2. 每个方案做一次快速模拟 + 评分
+        3. 筛选出成功进球的方案
+        4. 按评分排序，选 top-3
+        5. 对 top-3 进行精细模拟（10次）
+        6. 选择最高分方案
+        
+        返回:
+            Optional[Tuple[action, score]]: 成功进球的方案，或None
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None:
+            return None
+        
+        # 搜索配置
+        FORCE_V0 = 7.0  # 大力
+        PHI_OFFSETS = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]  # 11点搜索
+        TOP_K = 3       # 精细模拟的候选数量
+        FINE_SIM_COUNT = 10  # 精细模拟次数
+        
+        # 获取合法目标球（在场上的己方球）
+        legal_targets = [
+            t for t in my_targets 
+            if t in balls and balls[t].state.s != 4 and t != '8'
+        ]
+        
+        # 如果己方球清空，可以打黑8
+        if not legal_targets and '8' in balls and balls['8'].state.s != 4:
+            legal_targets = ['8']
+        
+        if not legal_targets:
+            print("    [ForceAttack] No legal targets!")
+            return None
+        
+        print(f"    [ForceAttack] Searching for {len(legal_targets)} targets...")
+        
+        # ========== 第一阶段：快速筛选 ==========
+        candidates = []  # [(action, target_id, quick_score), ...]
+        
+        for target_id in legal_targets:
+            target_ball = balls[target_id]
+            
+            for pocket_id, pocket in table.pockets.items():
+                # 1. 获取基础角度（几何求解）
+                solutions = solve_direct_shot(cue_ball, target_ball, pocket, balls, table)
+                
+                if not solutions:
+                    continue
+                
+                base_phi = solutions[0]['phi']
+                
+                # 2. 11点角度搜索
+                for offset in PHI_OFFSETS:
+                    phi = (base_phi + offset) % 360
+                    
+                    action = {
+                        'V0': FORCE_V0,
+                        'phi': phi,
+                        'theta': 0,
+                        'a': 0,
+                        'b': 0
+                    }
+                    
+                    # 3. 快速模拟（1次）
+                    success, shot = simulate_shot(action, balls, table)
+                    if not success or shot is None:
+                        continue
+                    
+                    # 4. 评分
+                    balls_state_before = {bid: b.state.s for bid, b in balls.items()}
+                    score_result = score_shot(shot, balls_state_before, target_id, my_targets, table)
+                    
+                    # 5. 只保留成功进球且无严重犯规的方案
+                    if score_result['result']['success'] and score_result['foul_penalty'] > -200:
+                        candidates.append({
+                            'action': action,
+                            'target_id': target_id,
+                            'quick_score': score_result['total_score']
+                        })
+        
+        if not candidates:
+            print("    [ForceAttack] No candidates found after quick simulation.")
+            return None
+        
+        print(f"    [ForceAttack] Found {len(candidates)} viable candidates, selecting top-{TOP_K}...")
+        
+        # ========== 第二阶段：选 top-K 精细模拟 ==========
+        # 按 quick_score 排序，选 top-K
+        candidates.sort(key=lambda x: x['quick_score'], reverse=True)
+        top_candidates = candidates[:TOP_K]
+        
+        best_action = None
+        best_score = -float('inf')
+        
+        for candidate in top_candidates:
+            action = candidate['action']
+            target_id = candidate['target_id']
+            
+            # 精细模拟：多次模拟取统计
+            success_count = 0
+            total_score = 0.0
+            foul_count = 0
+            
+            for _ in range(FINE_SIM_COUNT):
+                # 添加噪声
+                noisy_action = add_noise_to_action(action, self.noise_config)
+                
+                # 模拟
+                success, shot = simulate_shot(noisy_action, balls, table)
+                if not success or shot is None:
+                    continue
+                
+                # 评分
+                balls_state_before = {bid: b.state.s for bid, b in balls.items()}
+                score_result = score_shot(shot, balls_state_before, target_id, my_targets, table)
+                
+                if score_result['result']['success']:
+                    success_count += 1
+                    total_score += score_result['total_score']
+                
+                if score_result['result']['foul']:
+                    foul_count += 1
+            
+            # 计算最终评分
+            if success_count > 0:
+                success_rate = success_count / FINE_SIM_COUNT
+                avg_score = total_score / success_count
+                foul_rate = foul_count / FINE_SIM_COUNT
+                
+                # 综合评分：成功率权重 + 平均分 - 犯规惩罚
+                final_score = success_rate * 50 + avg_score * 0.5 - foul_rate * 20
+                
+                if final_score > best_score:
+                    best_score = final_score
+                    best_action = action
+        
+        if best_action is not None:
+            print(f"    [ForceAttack] Best found: score={best_score:.2f}")
+            return best_action, best_score
+        
+        print("    [ForceAttack] No good plan after fine simulation.")
+        return None
+
+    def _defense_safe_push(
+        self,
+        balls: Dict[str, Any],
+        my_targets: List[str],
+        table: Any
+    ) -> Optional[Tuple[Dict[str, float], float]]:
+        """
+        阶段2: 安全推进
+        
+        轻推己方球到更好位置:
+        - 目标球离袋口越近越好
+        - 目标球离库边越远越好
+        - 避免犯规
+        
+        返回:
+            Optional[Tuple[action, score]]: 最佳推球方案
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None:
+            return None
+        
+        cue_pos = cue_ball.state.rvw[0]
+        
+        # 搜索配置
+        PUSH_V0_OPTIONS = [1.5, 2.0, 2.5, 3.0]  # 轻推力度
+        PHI_OFFSETS = [-15, -10, -5, 0, 5, 10, 15]  # 7点角度搜索
+        
+        # 获取合法目标球
+        legal_targets = [
+            t for t in my_targets 
+            if t in balls and balls[t].state.s != 4 and t != '8'
+        ]
+        
+        if not legal_targets:
+            # 如果没有普通目标球，尝试打黑8（但这种情况应该由进攻处理）
+            print("    [SafePush] No legal targets for push!")
+            return None
+        
+        total_combinations = len(legal_targets) * len(PUSH_V0_OPTIONS) * len(PHI_OFFSETS)
+        print(f"    [SafePush] Searching {total_combinations} combinations ({len(legal_targets)} targets x {len(PUSH_V0_OPTIONS)} forces x {len(PHI_OFFSETS)} angles)...")
+        
+        best_action = None
+        best_score = -float('inf')
+        
+        for target_id in legal_targets:
+            target_ball = balls[target_id]
+            target_pos = target_ball.state.rvw[0]
+            
+            # 计算白球指向目标球的基础角度
+            vec_to_target = target_pos[:2] - cue_pos[:2]
+            base_phi = np.degrees(np.arctan2(vec_to_target[1], vec_to_target[0])) % 360
+            
+            for v0 in PUSH_V0_OPTIONS:
+                for offset in PHI_OFFSETS:
+                    phi = (base_phi + offset) % 360
+                    
+                    action = {
+                        'V0': v0,
+                        'phi': phi,
+                        'theta': 0,
+                        'a': 0,
+                        'b': 0
+                    }
+                    
+                    # 模拟
+                    success, shot = simulate_shot(action, balls, table)
+                    if not success or shot is None:
+                        continue
+                    
+                    # 评估推球效果
+                    push_score = self._evaluate_push_result(
+                        shot, balls, target_id, my_targets, table
+                    )
+                    
+                    if push_score > best_score:
+                        best_score = push_score
+                        best_action = action
+        
+        if best_action is not None:
+            print(f"    [SafePush] Best found: V0={best_action['V0']:.1f}, phi={best_action['phi']:.1f}, score={best_score:.2f}")
+            return best_action, best_score
+        
+        print("    [SafePush] No valid push action found.")
+        return None
+
+    def _evaluate_push_result(
+        self,
+        shot: pt.System,
+        balls_before: Dict[str, Any],
+        target_id: str,
+        my_targets: List[str],
+        table: Any
+    ) -> float:
+        """
+        评估推球结果
+        
+        评分维度:
+        1. 目标球离最近袋口的距离 (越近越好) - 40分
+        2. 目标球离库边的距离 (越远越好) - 30分
+        3. 犯规惩罚 - 负分
+        4. 额外：如果目标球进袋了，大奖励
+        
+        返回:
+            float: 推球评分
+        """
+        # 检查犯规
+        balls_state_before = {bid: b.state.s for bid, b in balls_before.items()}
+        result = analyze_shot_result(shot, balls_state_before, target_id, my_targets)
+        
+        # 严重犯规直接返回极低分
+        if result['foul'] and result['foul_penalty'] <= -150:
+            return result['foul_penalty']
+        
+        # 如果目标球进袋了，大奖励
+        if result['success']:
+            return 150 + (result['foul_penalty'] if result['foul'] else 0)
+        
+        score = 0.0
+        
+        # 获取目标球最终位置
+        if target_id in shot.balls and shot.balls[target_id].state.s != 4:
+            target_final_pos = shot.balls[target_id].state.rvw[0]
+            
+            # 1. 目标球离最近袋口的距离 (越近越好)
+            min_pocket_dist = float('inf')
+            for pocket_id, pocket in table.pockets.items():
+                pocket_pos = get_pocket_position(pocket)
+                dist = np.linalg.norm(target_final_pos[:2] - pocket_pos[:2])
+                min_pocket_dist = min(min_pocket_dist, dist)
+            
+            # 归一化：假设最大距离2.5m
+            pocket_score = 40 * (1 - min(min_pocket_dist / 2.5, 1.0))
+            score += pocket_score
+            
+            # 2. 目标球离库边的距离 (越远越好)
+            R = 0.028575  # 球半径
+            dist_to_rails = [
+                target_final_pos[0] - R,                    # 左库
+                table.w - target_final_pos[0] - R,          # 右库
+                target_final_pos[1] - R,                    # 下库
+                table.l - target_final_pos[1] - R           # 上库
+            ]
+            min_rail_dist = max(0, min(dist_to_rails))
+            
+            # 归一化：库边安全距离约0.1m，满分0.15m以上
+            if min_rail_dist < 0.03:
+                rail_score = 0  # 贴库
+            elif min_rail_dist < 0.1:
+                rail_score = 15 * (min_rail_dist / 0.1)
+            else:
+                rail_score = 30  # 满分
+            
+            score += rail_score
+        
+        # 3. 犯规惩罚
+        if result['foul']:
+            score += result['foul_penalty']
+        
+        return score
 
     # ========================================================================
     #                              辅助方法
