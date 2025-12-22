@@ -133,7 +133,9 @@ def score_single_target_position(
     cue_pos: np.ndarray,
     target_ball,
     pocket,
-    table
+    table,
+    balls_after: dict = None,
+    target_id: str = None
 ) -> float:
     """
     计算针对单个目标球的走位评分
@@ -142,12 +144,15 @@ def score_single_target_position(
         1. 目标球到袋口的距离 (越近越好)
         2. 母球到目标球的距离 (适中最好，太近太远都扣分)
         3. 母球-目标球连线 与 目标球-袋口连线 的夹角 (越接近180°越好 = 直球)
+        4. 路径障碍惩罚 (如果有球挡住路径)
     
     参数:
         cue_pos: 母球位置 (x, y, z)
         target_ball: 目标球对象
         pocket: 袋口对象
         table: 球桌对象
+        balls_after: 模拟后的球状态 (可选，用于障碍检测)
+        target_id: 目标球ID (可选，用于排除自身)
     
     返回:
         float: 单目标走位分 (0-50)
@@ -159,6 +164,8 @@ def score_single_target_position(
     cue_xy = cue_pos[:2]
     target_xy = target_pos[:2]
     pocket_xy = pocket_pos[:2]
+    
+    R = 0.028575  # 球半径
     
     # ========== 1. 目标球到袋口距离评分 ==========
     # 距离越近越好，满分15分
@@ -192,10 +199,65 @@ def score_single_target_position(
     angle = calculate_angle(vec_cue_to_target, vec_target_to_pocket)
     angle_score = 20 * (angle / 180.0)
     
-    # ========== 总分 ==========
-    total_score = dist_pocket_score + dist_cue_score + angle_score
+    # ========== 4. 路径障碍检测 ==========
+    obstacle_penalty = 0
     
-    return total_score
+    if balls_after is not None:
+        # 检查母球到目标球路径
+        cue_to_target_blocked = False
+        for bid, ball in balls_after.items():
+            if bid in ['cue', target_id] or ball.state.s == 4:
+                continue
+            ball_pos = ball.state.rvw[0][:2]
+            # 点到线段的距离
+            dist = point_to_segment_distance(ball_pos, cue_xy, target_xy)
+            if dist < 2 * R + 0.01:  # 两球半径 + 一点余量
+                cue_to_target_blocked = True
+                break
+        
+        if cue_to_target_blocked:
+            obstacle_penalty -= 30  # 母球到目标球路径被挡
+        
+        # 检查目标球到袋口路径
+        target_to_pocket_blocked = False
+        for bid, ball in balls_after.items():
+            if bid in ['cue', target_id] or ball.state.s == 4:
+                continue
+            ball_pos = ball.state.rvw[0][:2]
+            dist = point_to_segment_distance(ball_pos, target_xy, pocket_xy)
+            if dist < 2 * R + 0.01:
+                target_to_pocket_blocked = True
+                break
+        
+        if target_to_pocket_blocked:
+            obstacle_penalty -= 15  # 目标球到袋口路径被挡
+    
+    # ========== 总分 ==========
+    total_score = dist_pocket_score + dist_cue_score + angle_score + obstacle_penalty
+    
+    return max(0, total_score)  # 确保非负
+
+
+def point_to_segment_distance(point, seg_start, seg_end):
+    """计算点到线段的距离"""
+    point = np.array(point)
+    seg_start = np.array(seg_start)
+    seg_end = np.array(seg_end)
+    
+    v = seg_end - seg_start
+    w = point - seg_start
+    
+    c1 = np.dot(w, v)
+    if c1 <= 0:
+        return np.linalg.norm(point - seg_start)
+    
+    c2 = np.dot(v, v)
+    if c2 <= c1:
+        return np.linalg.norm(point - seg_end)
+    
+    b = c1 / c2
+    pb = seg_start + b * v
+    return np.linalg.norm(point - pb)
 
 
 def score_position(
@@ -208,7 +270,7 @@ def score_position(
     评估白球停点质量 - 遍历所有剩余目标球，取最高分
     
     对于每个剩余目标球，遍历6个袋口，计算走位评分，
-    最终返回所有组合中的最高分
+    最终返回所有组合中的最高分（含路径障碍检测）
     
     参数:
         cue_pos: 白球最终位置 (x, y, z) 或 (x, y)
@@ -237,7 +299,11 @@ def score_position(
         
         # 遍历所有袋口
         for pocket_id, pocket in table.pockets.items():
-            score = score_single_target_position(cue_pos, target_ball, pocket, table)
+            # 传入 balls_after 和 target_id 以启用障碍检测
+            score = score_single_target_position(
+                cue_pos, target_ball, pocket, table,
+                balls_after=balls_after, target_id=target_id
+            )
             if score > best_score:
                 best_score = score
     
@@ -567,7 +633,7 @@ class NewAgent(Agent):
     2. simulate_and_score - 蒙特卡洛模拟+评分
     3. _evaluate_position - 走位评分
     4. evaluate_attack_options - 评估所有进攻选项
-    5. evaluate_defense_options - 防守评估（复用进攻评估器模拟对手）
+    5. _bayesian_refine - 贝叶斯小范围微调
     6. decision - 精简的主入口
     """
     
@@ -586,17 +652,23 @@ class NewAgent(Agent):
         self.default_v0 = 2.4  # 默认力度
         
         # ==================== 多档力度系统 ====================
-        # 5档力度：极小力、小力、中力、大力、极大力
+        # 6档力度：超小力、极小力、小力、中力、大力、极大力
         self.power_levels = {
+            'ultra_soft': 1.0,  # 超小力：保守击球/极近距离
             'very_soft': 1.5,   # 极小力：近距离精细控制
             'soft': 2.5,        # 小力：近距离进球
             'medium': 4.0,      # 中力：中距离进球
             'hard': 5.5,        # 大力：远距离进球
             'very_hard': 7.0,   # 极大力：超远距离/穿透
         }
-        self.power_names = ['very_soft', 'soft', 'medium', 'hard', 'very_hard']
+        self.power_names = ['ultra_soft', 'very_soft', 'soft', 'medium', 'hard', 'very_hard']
         
-        print("[NewAgent] 简化版架构初始化完成（两阶段筛选 + 10次精细模拟）")
+        # ==================== 贝叶斯微调配置 ====================
+        self.BAYES_INIT_POINTS = 5   # 初始采样点
+        self.BAYES_N_ITER = 8        # 优化迭代次数
+        self.BAYES_ENABLE = True     # 是否启用贝叶斯微调
+        
+        print("[NewAgent] 架构初始化完成（6档力度 + Top-15精细模拟 + 贝叶斯微调）")
 
     # ==================== 主决策入口 ====================
     
@@ -664,7 +736,7 @@ class NewAgent(Agent):
             print(f"{'='*60}\n")
             return action
         else:
-            # 5. 没有高成功率方案，选择次优或保守击球
+            # 5. 没有高成功率方案，选择次优并进行贝叶斯微调
             print(f"\n  进攻分数不足或无高成功率方案...")
             
             # 尝试从所有方案中选择最佳的（即使成功率不够高）
@@ -678,13 +750,28 @@ class NewAgent(Agent):
                 print(f"      类型: {fallback['shot_type']} ({cushion_str})")
                 print(f"      力度档位: {fallback.get('power_level', 'N/A')} (V0={action['V0']:.1f})")
                 print(f"      成功率: {fallback['success_rate']:.0%}, 总分: {fallback['final_score']:.1f}")
+                
+                # === 贝叶斯微调（对次优方案进行优化）===
+                if self.BAYES_ENABLE:
+                    print(f"  [贝叶斯微调] 对次优方案进行优化...")
+                    refined_action, refined_score = self._bayesian_refine(
+                        action, balls, legal_targets, table, fallback['target_id']
+                    )
+                    if refined_score > 30:  # 微调后分数足够高才采用
+                        action = refined_action
+                        print(f"  [贝叶斯微调] 完成! 分数={refined_score:.1f}")
+                        print(f"      V0={action['V0']:.2f}, phi={action['phi']:.1f}°, "
+                              f"theta={action['theta']:.1f}°, a={action['a']:.2f}, b={action['b']:.2f}")
+                    else:
+                        print(f"  [贝叶斯微调] 未找到更好方案 (分数={refined_score:.1f})")
+                
                 print(f"{'='*60}\n")
                 return action
             else:
                 # 无任何方案，保守轻打目标球
                 print(f"\n  >>> 决策: 保守击球 (极小力轻打目标球)")
                 action = self._conservative_shot(balls, legal_targets[0], table)
-                print(f"      力度档位: very_soft (V0={action['V0']:.1f})")
+                print(f"      力度档位: ultra_soft (V0={action['V0']:.1f})")
                 print(f"      角度: phi={action['phi']:.1f}°")
                 print(f"{'='*60}\n")
                 return action
@@ -702,20 +789,68 @@ class NewAgent(Agent):
 
     def _conservative_shot(self, balls, target_id, table):
         """
-        保守击球：轻打向目标球
+        保守击球：轻打向己方目标球
         当没有找到任何可行进攻方案时使用
-        使用力度系统的最小力档位
+        
+        改进：遍历己方所有球，找到路径清晰的目标，确保首球碰撞是己方球
         """
         cue_pos = balls['cue'].state.rvw[0]
-        target_pos = balls[target_id].state.rvw[0]
+        R = balls['cue'].params.R
+        
+        # 确定己方目标球
+        if target_id in [str(i) for i in range(1, 8)]:
+            my_ball_ids = [str(i) for i in range(1, 8)]
+        elif target_id in [str(i) for i in range(9, 16)]:
+            my_ball_ids = [str(i) for i in range(9, 16)]
+        else:
+            my_ball_ids = [target_id]
+        
+        # 遍历己方所有球，找到路径最清晰的目标
+        best_target = None
+        best_distance = float('inf')
+        
+        for bid in my_ball_ids:
+            if bid not in balls or balls[bid].state.s == 4:
+                continue
+            
+            target_pos = balls[bid].state.rvw[0]
+            
+            # 检查路径是否清晰（没有其他球在路径上）
+            path_clear = True
+            for other_bid, other_ball in balls.items():
+                if other_bid in ['cue', bid] or other_ball.state.s == 4:
+                    continue
+                other_pos = other_ball.state.rvw[0][:2]
+                
+                # 检测点到线段的距离
+                dist = point_to_segment_distance(other_pos, cue_pos[:2], target_pos[:2])
+                if dist < 2 * R + 0.01:
+                    path_clear = False
+                    break
+            
+            if path_clear:
+                # 路径清晰，计算距离
+                distance = np.linalg.norm(target_pos - cue_pos)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_target = bid
+        
+        # 如果没有路径清晰的球，使用原始目标（可能会犯规，但至少尝试）
+        if best_target is None:
+            best_target = target_id
+            print(f"  [保守击球] 警告：没有路径清晰的目标球，使用 {target_id}")
+        else:
+            print(f"  [保守击球] 选择路径清晰的目标球: {best_target}")
+        
+        target_pos = balls[best_target].state.rvw[0]
         
         # 计算击球角度
         direction = target_pos - cue_pos
         phi = np.degrees(np.arctan2(direction[1], direction[0])) % 360
         
-        # 使用力度系统的极小力档位
+        # 使用力度系统的超小力档位
         return {
-            'V0': self.power_levels['very_soft'],  # 极小力
+            'V0': self.power_levels['ultra_soft'],  # 超小力
             'phi': phi,
             'theta': 0,
             'a': 0,
@@ -993,7 +1128,10 @@ class NewAgent(Agent):
                     # ==================== 多档力度选择 ====================
                     # 根据距离和库数确定合适的力度档位范围
                     # 距离分档: <0.8m 近距离, 0.8-1.5m 中距离, >1.5m 远距离
-                    if total_dist < 0.8:
+                    if total_dist < 0.5:
+                        # 极近距离：超小力、极小力、小力
+                        suitable_powers = ['ultra_soft', 'very_soft', 'soft']
+                    elif total_dist < 0.8:
                         # 近距离：极小力、小力、中力
                         suitable_powers = ['very_soft', 'soft', 'medium']
                     elif total_dist < 1.5:
@@ -1006,6 +1144,7 @@ class NewAgent(Agent):
                     # 如果有库边，增加一档力度 (最大到 very_hard)
                     if cushions > 0:
                         power_upgrade = {
+                            'ultra_soft': 'very_soft',
                             'very_soft': 'soft',
                             'soft': 'medium',
                             'medium': 'hard',
@@ -1078,8 +1217,12 @@ class NewAgent(Agent):
             
             # 切角惩罚
             verify_score -= candidate.get('cut_angle', 0) * 0.3
-            # 库边惩罚
-            verify_score -= candidate.get('cushions', 0) * 10
+            # 库边惩罚 (Kick球比Bank球更不稳定)
+            cushions = candidate.get('cushions', 0)
+            if candidate.get('shot_type', '') == 'Kick':
+                verify_score -= cushions * 15  # Kick球惩罚更重
+            else:
+                verify_score -= cushions * 10  # Bank球惩罚
             
             candidate['verify_score'] = verify_score
             
@@ -1095,12 +1238,12 @@ class NewAgent(Agent):
             verified_candidates = all_candidates[:8]
             print(f"  [阶段1] 无有效方案，使用评分 Top-10")
         
-        # ==================== 阶段2: Top-10 精细模拟 ====================
+        # ==================== 阶段2: Top-15 精细模拟 ====================
         # 按验证评分排序
         verified_candidates.sort(key=lambda x: -x['verify_score'])
-        top_candidates = verified_candidates[:10]
+        top_candidates = verified_candidates[:15]
         
-        print(f"  [阶段2] 精细模拟 Top-{len(top_candidates)} 候选 (10次):")
+        print(f"  [阶段2] 精细模拟 Top-{len(top_candidates)} 候选 (15次):")
         
         scored_candidates = []
         for idx, candidate in enumerate(top_candidates):
@@ -1111,7 +1254,7 @@ class NewAgent(Agent):
                 table,
                 candidate['target_id'],
                 legal_targets,
-                num_simulations=10
+                num_simulations=15
             )
             
             candidate.update(score_result)
@@ -1279,6 +1422,103 @@ class NewAgent(Agent):
             'a': np.clip(action.get('a', 0) + np.random.normal(0, self.noise_std['a']), -0.5, 0.5),
             'b': np.clip(action.get('b', 0) + np.random.normal(0, self.noise_std['b']), -0.5, 0.5)
         }
+
+    # ==================== 贝叶斯小范围微调 ====================
+    
+    def _bayesian_refine(self, geo_action, balls, my_targets, table, target_id):
+        """
+        在几何解附近进行贝叶斯小范围微调
+        
+        参数:
+            geo_action: 几何求解得到的初始动作 {'V0', 'phi', 'theta', 'a', 'b'}
+            balls: 球状态
+            my_targets: 己方目标球
+            table: 球桌
+            target_id: 目标球ID
+            
+        返回:
+            (refined_action, score): 微调后的动作和分数
+        """
+        if not self.BAYES_ENABLE:
+            return geo_action, 0
+        
+        # 定义小范围搜索空间
+        pbounds = {
+            'V0': (max(0.5, geo_action['V0'] - 1.5), min(8.0, geo_action['V0'] + 1.5)),
+            'phi': (geo_action['phi'] - 10, geo_action['phi'] + 10),
+            'theta': (0, 12),
+            'a': (-0.25, 0.25),
+            'b': (-0.25, 0.25)
+        }
+        
+        # 保存击球前状态
+        balls_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        
+        def reward_fn(V0, phi, theta, a, b):
+            """评估单次击球的分数"""
+            try:
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                action = {'V0': V0, 'phi': phi % 360, 'theta': theta, 'a': a, 'b': b}
+                shot.cue.set_state(**action)
+                
+                if not simulate_with_timeout(shot, timeout=2):
+                    return -100
+                
+                # 分析结果
+                balls_state_before = {bid: balls_snapshot[bid].state.s for bid in balls_snapshot}
+                result = self._analyze_shot_result(shot, balls_state_before, target_id, my_targets)
+                
+                # 计算分数
+                score = 0
+                if result['is_success']:
+                    score += 80
+                    # 走位评分
+                    pos_score = self._evaluate_position(
+                        result['cue_final_pos'], my_targets, shot.balls, table
+                    )
+                    score += pos_score * 0.5
+                
+                if result['is_foul']:
+                    score += result['penalty']
+                
+                return score
+                
+            except Exception as e:
+                return -200
+        
+        try:
+            optimizer = BayesianOptimization(
+                f=reward_fn,
+                pbounds=pbounds,
+                random_state=np.random.randint(1000000),
+                verbose=0
+            )
+            
+            optimizer.maximize(
+                init_points=self.BAYES_INIT_POINTS,
+                n_iter=self.BAYES_N_ITER
+            )
+            
+            best = optimizer.max
+            params = best['params']
+            
+            refined_action = {
+                'V0': float(params['V0']),
+                'phi': float(params['phi'] % 360),
+                'theta': float(params['theta']),
+                'a': float(params['a']),
+                'b': float(params['b']),
+            }
+            
+            return refined_action, best['target']
+            
+        except Exception as e:
+            print(f"  [贝叶斯微调] 失败: {e}")
+            return geo_action, 0
 
     def _analyze_shot_result(self, shot, balls_state_before, target_id, my_targets):
         """
@@ -1468,23 +1708,91 @@ class NewAgent(Agent):
         return max(0, total_score)  # 确保非负
 
 
+    # 库边反弹物理参数
+    # 恢复系数 (垂直分量): 约 0.85-0.90
+    # 平行摩擦系数: 约 0.86-0.90
+    CUSHION_RESTITUTION = 0.87  # 垂直方向恢复系数
+    CUSHION_FRICTION = 0.88     # 平行方向速度保持系数
+    
     @staticmethod
     def get_mirror(point, rail):
+        """理想镜像（入射角=反射角）"""
         p = point.copy()
         p[rail['axis']] = 2 * rail['val'] - p[rail['axis']]
         return p
+    
+    @staticmethod
+    def get_adjusted_mirror(point, start_pos, rail, e=0.87, mu=0.88):
+        """
+        考虑弹性损耗的调整镜像
+        
+        物理原理：
+        - 垂直分量: v_n_out = e * v_n_in (恢复系数)
+        - 平行分量: v_t_out = mu * v_t_in (摩擦保持)
+        
+        由于平行分量损耗比垂直分量小，反射角会比入射角更"陡峭"
+        
+        调整策略：
+        镜像点需要向库边方向拉近，以补偿平行速度损耗
+        """
+        p = point.copy()
+        
+        # 计算到库边的距离
+        dist_to_rail = abs(point[rail['axis']] - rail['val'])
+        
+        # 计算平行方向的距离
+        other_axis = 1 - rail['axis']
+        parallel_dist = abs(point[other_axis] - start_pos[other_axis])
+        
+        # 调整系数：平行速度损耗导致镜像点需要调整
+        # 实际反射角 tan(θ_out) = (mu * v_parallel) / (e * v_normal)
+        # 相对于理想反射: adjustment = e / mu
+        adjustment = e / mu  # ≈ 0.99，即镜像点需要稍微拉近
+        
+        # 调整镜像点
+        p[rail['axis']] = 2 * rail['val'] - point[rail['axis']]
+        
+        # 微调：将镜像点向库边拉近一点
+        # 这会使出射角更陡峭（更垂直于库边）
+        mirror_dist = abs(p[rail['axis']] - rail['val'])
+        new_dist = mirror_dist * adjustment
+        
+        if p[rail['axis']] > rail['val']:
+            p[rail['axis']] = rail['val'] + new_dist
+        else:
+            p[rail['axis']] = rail['val'] - new_dist
+        
+        return p
         
     @staticmethod
-    def get_cushion_path(start_pos, end_pos, rail_sequence):
+    def get_cushion_path(start_pos, end_pos, rail_sequence, use_physics=True):
+        """
+        计算库边反弹路径
+        
+        参数:
+            start_pos: 起始位置
+            end_pos: 目标位置
+            rail_sequence: 库边序列
+            use_physics: 是否考虑弹性损耗 (默认True)
+        """
+        e = NewAgent.CUSHION_RESTITUTION
+        mu = NewAgent.CUSHION_FRICTION
+        
         # 1. 从后往前生成镜像目标点
         mirrored_targets = []
         current_target = end_pos
+        prev_pos = end_pos  # 用于计算调整镜像
+        
         for rail in reversed(rail_sequence):
-            current_target = NewAgent.get_mirror(current_target, rail)
+            if use_physics:
+                current_target = NewAgent.get_adjusted_mirror(current_target, prev_pos, rail, e, mu)
+            else:
+                current_target = NewAgent.get_mirror(current_target, rail)
             mirrored_targets.append(current_target)
+            prev_pos = current_target
         
         # 2. 从前往后计算交点
-        targets_to_aim = mirrored_targets[::-1] # [First_Mirror, Second_Mirror, ..., End]
+        targets_to_aim = mirrored_targets[::-1]
         path_points = [start_pos]
         current_p = start_pos
         
@@ -1497,7 +1805,7 @@ class NewAgent(Agent):
             if abs(vec[rail['axis']]) < 1e-6: return None
             t = (rail['val'] - current_p[rail['axis']]) / vec[rail['axis']]
             
-            if t <= 1e-4: return None # 必须向前
+            if t <= 1e-4: return None
             
             p_intersect = current_p + t * vec
             p_intersect[2] = 0
