@@ -6,6 +6,10 @@ from datetime import datetime
 import copy
 import signal
 
+from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern
+
 from .agent import Agent
 
 # ============ 超时安全模拟机制 ============
