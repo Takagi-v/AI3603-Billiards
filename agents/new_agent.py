@@ -3,9 +3,400 @@ import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
 from datetime import datetime
+import copy
+import signal
 
 from .agent import Agent
 
+# ============ 超时安全模拟机制 ============
+class SimulationTimeoutError(Exception):
+    """物理模拟超时异常"""
+    pass
+
+def _timeout_handler(signum, frame):
+    """超时信号处理器"""
+    raise SimulationTimeoutError("物理模拟超时")
+
+def simulate_with_timeout(shot, timeout=3):
+    """带超时保护的物理模拟
+    
+    参数：
+        shot: pt.System 对象
+        timeout: 超时时间（秒），默认3秒
+    
+    返回：
+        bool: True 表示模拟成功，False 表示超时或失败
+    
+    说明：
+        使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
+        超时后自动恢复，不会导致程序卡死
+    """
+    # 设置超时信号处理器
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)  # 设置超时时间
+    
+    try:
+        pt.simulate(shot, inplace=True)
+        signal.alarm(0)  # 取消超时
+        return True
+    except SimulationTimeoutError:
+        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+        return False
+    except Exception as e:
+        signal.alarm(0)  # 取消超时
+        raise e
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+
+# ============================================
+
+# ============ 走位评分工具函数 (从 agent_new.py 移植) ============
+
+def get_ball_position(ball) -> np.ndarray:
+    """提取球的位置坐标 (x, y, z)"""
+    return ball.state.rvw[0].copy()
+
+
+def get_pocket_position(pocket, table=None) -> np.ndarray:
+    """
+    提取袋口的位置坐标（带中袋偏移修正）
+    
+    中袋（side pockets）的物理袋口边缘比几何中心更靠外，
+    为了提高瞄准稳定性，对中袋的瞄准点向球桌中心方向偏移。
+    
+    参数:
+        pocket: 袋口对象
+        table: 球桌对象（可选，用于判断球桌中心位置）
+    
+    返回:
+        np.ndarray: 袋口位置 (x, y, z)
+    """
+    # 获取原始袋口位置
+    if hasattr(pocket, 'center'):
+        pos = np.array([pocket.center[0], pocket.center[1], 0])
+    elif hasattr(pocket, 'a'):
+        pos = np.array([pocket.a, pocket.b, 0])
+    else:
+        pos = np.array([pocket.x, pocket.y, 0])
+    
+    # 对中袋（side pockets）添加偏移
+    # 中袋的ID通常包含 'c' (center)，如 'lc', 'rc'
+    pocket_id = getattr(pocket, 'id', '')
+    if 'c' in pocket_id.lower():
+        # 中袋偏移：向球桌中心方向偏移
+        # 袋口半径约 0.0645m，偏移半径的 50%
+        r_side = 0.0645
+        offset = r_side * 0.5
+        
+        # 判断是左中袋还是右中袋
+        if pos[0] < 0.5:  # 左中袋
+            pos[0] += offset  # 向右（中心）偏移
+        else:  # 右中袋
+            pos[0] -= offset  # 向左（中心）偏移
+    
+    return pos
+
+
+def calculate_angle(v1: np.ndarray, v2: np.ndarray) -> float:
+    """
+    计算两个向量之间的夹角（度数）
+    
+    返回:
+        float: 夹角，范围 [0, 180]
+    """
+    v1_norm = np.linalg.norm(v1)
+    v2_norm = np.linalg.norm(v2)
+    if v1_norm < 1e-9 or v2_norm < 1e-9:
+        return 0.0
+    cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return math.degrees(math.acos(cos_angle))
+
+
+def score_single_target_position(
+    cue_pos: np.ndarray,
+    target_ball,
+    pocket,
+    table,
+    balls_after: dict = None,
+    target_id: str = None
+) -> float:
+    """
+    计算针对单个目标球的走位评分
+    
+    评分维度:
+        1. 目标球到袋口的距离 (越近越好)
+        2. 母球到目标球的距离 (适中最好，太近太远都扣分)
+        3. 母球-目标球连线 与 目标球-袋口连线 的夹角 (越接近180°越好 = 直球)
+        4. 路径障碍惩罚 (如果有球挡住路径)
+    
+    参数:
+        cue_pos: 母球位置 (x, y, z)
+        target_ball: 目标球对象
+        pocket: 袋口对象
+        table: 球桌对象
+        balls_after: 模拟后的球状态 (可选，用于障碍检测)
+        target_id: 目标球ID (可选，用于排除自身)
+    
+    返回:
+        float: 单目标走位分 (0-50)
+    """
+    target_pos = get_ball_position(target_ball)
+    pocket_pos = get_pocket_position(pocket)
+    
+    # 只取 xy 平面
+    cue_xy = cue_pos[:2]
+    target_xy = target_pos[:2]
+    pocket_xy = pocket_pos[:2]
+    
+    R = 0.028575  # 球半径
+    
+    # ========== 1. 目标球到袋口距离评分 ==========
+    # 距离越近越好，满分15分
+    dist_target_to_pocket = np.linalg.norm(target_xy - pocket_xy)
+    max_dist = 2.5  # 假设球桌对角线长度约 2.5m
+    dist_ratio = min(dist_target_to_pocket / max_dist, 1.0)
+    dist_pocket_score = 15 * (1 - dist_ratio)
+    
+    # ========== 2. 母球到目标球距离评分 ==========
+    # 适中距离最好（约0.3-0.8m），太近出杆困难，太远精度下降
+    dist_cue_to_target = np.linalg.norm(cue_xy - target_xy)
+    optimal_min = 0.3
+    optimal_max = 0.8
+    
+    if dist_cue_to_target < 0.1:
+        dist_cue_score = 2  # 贴球，严重扣分
+    elif dist_cue_to_target < optimal_min:
+        dist_cue_score = 7 + 5 * ((dist_cue_to_target - 0.1) / (optimal_min - 0.1))
+    elif dist_cue_to_target <= optimal_max:
+        dist_cue_score = 15  # 最佳距离范围，满分
+    elif dist_cue_to_target < 1.5:
+        dist_cue_score = 15 - 8 * ((dist_cue_to_target - optimal_max) / (1.5 - optimal_max))
+    else:
+        dist_cue_score = 5  # 太远
+    
+    # ========== 3. 夹角评分 ==========
+    vec_cue_to_target = target_xy - cue_xy
+    vec_target_to_pocket = pocket_xy - target_xy
+    
+    # 计算夹角（越接近180度越好 = 直球）
+    angle = calculate_angle(vec_cue_to_target, vec_target_to_pocket)
+    angle_score = 20 * (angle / 180.0)
+    
+    # ========== 4. 路径障碍检测 ==========
+    obstacle_penalty = 0
+    
+    if balls_after is not None:
+        # 检查母球到目标球路径
+        cue_to_target_blocked = False
+        for bid, ball in balls_after.items():
+            if bid in ['cue', target_id] or ball.state.s == 4:
+                continue
+            ball_pos = ball.state.rvw[0][:2]
+            # 点到线段的距离
+            dist = point_to_segment_distance(ball_pos, cue_xy, target_xy)
+            if dist < 2 * R + 0.01:  # 两球半径 + 一点余量
+                cue_to_target_blocked = True
+                break
+        
+        if cue_to_target_blocked:
+            obstacle_penalty -= 30  # 母球到目标球路径被挡
+        
+        # 检查目标球到袋口路径
+        target_to_pocket_blocked = False
+        for bid, ball in balls_after.items():
+            if bid in ['cue', target_id] or ball.state.s == 4:
+                continue
+            ball_pos = ball.state.rvw[0][:2]
+            dist = point_to_segment_distance(ball_pos, target_xy, pocket_xy)
+            if dist < 2 * R + 0.01:
+                target_to_pocket_blocked = True
+                break
+        
+        if target_to_pocket_blocked:
+            obstacle_penalty -= 15  # 目标球到袋口路径被挡
+    
+    # ========== 总分 ==========
+    total_score = dist_pocket_score + dist_cue_score + angle_score + obstacle_penalty
+    
+    return max(0, total_score)  # 确保非负
+
+
+def point_to_segment_distance(point, seg_start, seg_end):
+    """计算点到线段的距离"""
+    point = np.array(point)
+    seg_start = np.array(seg_start)
+    seg_end = np.array(seg_end)
+    
+    v = seg_end - seg_start
+    w = point - seg_start
+    
+    c1 = np.dot(w, v)
+    if c1 <= 0:
+        return np.linalg.norm(point - seg_start)
+    
+    c2 = np.dot(v, v)
+    if c2 <= c1:
+        return np.linalg.norm(point - seg_end)
+    
+    b = c1 / c2
+    pb = seg_start + b * v
+    return np.linalg.norm(point - pb)
+
+
+def score_position(
+    cue_pos: np.ndarray,
+    remaining_targets: list,
+    balls_after: dict,
+    table
+) -> float:
+    """
+    评估白球停点质量 - 遍历所有剩余目标球，取最高分
+    
+    对于每个剩余目标球，遍历6个袋口，计算走位评分，
+    最终返回所有组合中的最高分（含路径障碍检测）
+    
+    参数:
+        cue_pos: 白球最终位置 (x, y, z) 或 (x, y)
+        remaining_targets: 剩余己方目标球ID列表
+        balls_after: 模拟后的球状态 {ball_id: Ball}
+        table: 球桌对象
+    
+    返回:
+        float: 走位评分 (0-50)
+    """
+    if len(cue_pos) == 2:
+        cue_pos = np.array([cue_pos[0], cue_pos[1], 0])
+    
+    # 如果没有剩余目标球，检查是否该打黑8
+    if not remaining_targets:
+        remaining_targets = ['8']
+    
+    best_score = 0.0
+    
+    for target_id in remaining_targets:
+        if target_id not in balls_after:
+            continue
+        target_ball = balls_after[target_id]
+        if target_ball.state.s == 4:  # 已进袋
+            continue
+        
+        # 遍历所有袋口
+        for pocket_id, pocket in table.pockets.items():
+            # 传入 balls_after 和 target_id 以启用障碍检测
+            score = score_single_target_position(
+                cue_pos, target_ball, pocket, table,
+                balls_after=balls_after, target_id=target_id
+            )
+            if score > best_score:
+                best_score = score
+    
+    return best_score
+
+# ============================================
+
+
+def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
+    """
+    分析击球结果并计算奖励分数（完全对齐台球规则）
+    
+    参数：
+        shot: 已完成物理模拟的 System 对象
+        last_state: 击球前的球状态，{ball_id: Ball}
+        player_targets: 当前玩家目标球ID，['1', '2', ...] 或 ['8']
+    
+    返回：
+        float: 奖励分数
+            +50/球（己方进球）, +100（合法黑8）, +10（合法无进球）
+            -100（白球进袋）, -150（非法黑8/白球+黑8）, -30（首球/碰库犯规）
+    
+    规则核心：
+        - 清台前：player_targets = ['1'-'7'] 或 ['9'-'15']，黑8不属于任何人
+        - 清台后：player_targets = ['8']，黑8成为唯一目标球
+    """
+    
+    # 1. 基本分析
+    new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4]
+    
+    # 根据 player_targets 判断进球归属（黑8只有在清台后才算己方球）
+    own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
+    enemy_pocketed = [bid for bid in new_pocketed if bid not in player_targets and bid not in ["cue", "8"]]
+    
+    cue_pocketed = "cue" in new_pocketed
+    eight_pocketed = "8" in new_pocketed
+
+    # 2. 分析首球碰撞（定义合法的球ID集合）
+    first_contact_ball_id = None
+    foul_first_hit = False
+    valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+    
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+            # 过滤掉 'cue' 和非球对象（如 'cue stick'），只保留合法的球ID
+            other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+            if other_ids:
+                first_contact_ball_id = other_ids[0]
+                break
+    
+    # 首球犯规判定：完全对齐 player_targets
+    if first_contact_ball_id is None:
+        # 未击中任何球（但若只剩白球和黑8且已清台，则不算犯规）
+        if len(last_state) > 2 or player_targets != ['8']:
+            foul_first_hit = True
+    else:
+        # 首次击打的球必须是 player_targets 中的球
+        if first_contact_ball_id not in player_targets:
+            foul_first_hit = True
+    
+    # 3. 分析碰库
+    cue_hit_cushion = False
+    target_hit_cushion = False
+    foul_no_rail = False
+    
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if 'cushion' in et:
+            if 'cue' in ids:
+                cue_hit_cushion = True
+            if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                target_hit_cushion = True
+
+    if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+        foul_no_rail = True
+        
+    # 4. 计算奖励分数
+    score = 0
+    
+    # 白球进袋处理
+    if cue_pocketed and eight_pocketed:
+        score -= 150  # 白球+黑8同时进袋，严重犯规
+    elif cue_pocketed:
+        score -= 100  # 白球进袋
+    elif eight_pocketed:
+        # 黑8进袋：只有清台后（player_targets == ['8']）才合法
+        if player_targets == ['8']:
+            score += 100  # 合法打进黑8
+        else:
+            score -= 150  # 清台前误打黑8，判负
+            
+    # 首球犯规和碰库犯规
+    if foul_first_hit:
+        score -= 30
+    if foul_no_rail:
+        score -= 30
+        
+    # 进球得分（own_pocketed 已根据 player_targets 正确分类）
+    score += len(own_pocketed) * 50
+    score -= len(enemy_pocketed) * 20
+    
+    # 合法无进球小奖励
+    if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
+        score = 10
+        
+    return score
 
 class NewAgent(Agent):
     """
