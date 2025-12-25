@@ -828,44 +828,31 @@ class NewAgent(Agent):
         return opponent_choices[0]['score']
     
     def _find_best_safety_shot(self, balls, my_targets, table):
-        """寻找最佳防守方案，优先尝试大力出奇迹"""
+        """寻找最佳防守方案，优先尝试大力出奇迹，其次生成高概率合法的防守解"""
         
         # =========================================================================
         # 1. 大力出奇迹 (Force Attack / Miracle Shot)
-        # 策略：如果进攻受阻，先尝试用力击打目标球，期待"奇迹"（运气球或大力破局）
         # =========================================================================
         print("[Agent] 尝试大力出奇迹方案...")
         miracle_candidates = []
         cue_pos = balls['cue'].state.rvw[0]
         
-        # 遍历所有己方球
         for target_id in my_targets:
             if balls[target_id].state.s == 4: continue
             target_pos = balls[target_id].state.rvw[0]
             
-            # 前提：必须能打到目标球 (Cue -> Target 路径无阻挡)
-            # 如果连球都摸不到，就别想大力出奇迹了，那是大力犯规
             if self._count_obstructions(balls, cue_pos, target_pos, ['cue', target_id]) > 0:
                 continue
             
-            # 遍历所有袋口，生成大力击球方案
             for pocket in table.pockets.values():
                 pocket_pos = pocket.center
-                
-                # 计算几何参数 (不考虑Target->Pocket的阻挡，因为是奇迹球)
                 action = self._geo_shot(cue_pos, target_pos, pocket_pos)
-                
-                # 强制最大力度
                 action['V0'] = 7.5
                 
-                # 计算几何分数 (距离 + 切角)
-                # 切角过大(>85度)的球物理上很难打进，且容易滑杆，排除
                 cut_angle = self._calculate_cut_angle(cue_pos, target_pos, pocket_pos)
-                if abs(cut_angle) > 80:
-                    continue
+                if abs(cut_angle) > 80: continue
                 
                 dist = self._calc_dist(cue_pos, target_pos) + self._calc_dist(target_pos, pocket_pos)
-                # 几何评分：距离越近、角度越小越高分
                 geo_score = 100 - (dist * 10 + abs(cut_angle) * 0.8)
                 
                 miracle_candidates.append({
@@ -874,104 +861,113 @@ class NewAgent(Agent):
                     'desc': f"miracle {target_id}->pocket"
                 })
         
-        # 按几何分数排序，取前 5 个尝试
         miracle_candidates.sort(key=lambda x: x['geo_score'], reverse=True)
         top_miracles = miracle_candidates[:5]
         
         for cand in top_miracles:
-            # 1. 初步模拟验证 (2次)
             sim_score = self._evaluate_action(
                 cand['action'], trials=2, balls=balls, my_targets=my_targets, table=table,
                 threshold=15, enable_noise=True
             )
-            
-            # 门槛：40分
             if sim_score > 40:
-                # 2. 安全性检查 (跟主逻辑保持一致)
-                # 大力出奇迹极其容易洗袋，必须检查致命率
                 fatal_rate, _, verified_score = self._check_fatal_failure(
                     cand['action'], balls, my_targets, table, num_trials=5)
-                
                 if verified_score > 40 and fatal_rate <= 0.1:
-                    print(f"[Agent] 大力出奇迹生效！({cand['desc']}) 分数:{verified_score:.1f} 致命率:{fatal_rate:.1%}")
+                    print(f"[Agent] 大力出奇迹生效！({cand['desc']}) 分数:{verified_score:.1f}")
                     return cand['action']
 
-        print("[Agent] 奇迹未发生 (或风险过高)，切换普通防守模式...")
+        print("[Agent] 奇迹未发生，切换普通防守模式...")
 
         # =========================================================================
-        # 2. 普通防守策略 (原有逻辑)
+        # 2. 战术防守 (Tactical Safety)
         # =========================================================================
-        print("[Agent] 切换防守模式 - 计算斯诺克/贴库")
-        
         candidate_safeties = []
         
-        # 策略1：把白球藏到己方球后面
+        # --- 策略A: 推球吃库 (Push to Rail) ---
+        # 最稳妥的防守：将己方球推向库边，既做斯诺克又确保吃库不犯规
         for my_ball_id in my_targets:
-            if balls[my_ball_id].state.s == 4:
-                continue
-            
+            if balls[my_ball_id].state.s == 4: continue
             my_ball_pos = balls[my_ball_id].state.rvw[0]
             
-            for angle_deg in [0, 90, 180, 270]:
-                rad = angle_deg * np.pi / 180
-                hide_target = my_ball_pos[:2] + np.array([
-                    np.cos(rad), np.sin(rad)
-                ]) * (self.BALL_RADIUS * 3)
+            for c_name, c_val in self.cushions.items():
+                target_point = np.array(my_ball_pos[:2])
+                if 'x' in c_name: target_point[0] = c_val
+                else: target_point[1] = c_val
                 
-                direction = self._unit_vector(hide_target - cue_pos[:2])
-                phi = self._direction_to_degrees(direction)
+                # 检查去库边的路是否被挡 (只检查球到库)
+                # 简化检查：暂不检查，让模拟去筛
                 
-                candidate_safeties.append({
-                    'V0': 0.8,
-                    'phi': phi,
-                    'theta': 0,
-                    'a': 0,
-                    'b': 0
-                })
-        
-        # 策略2：轻推己方球到库边
-        for my_ball_id in my_targets:
-            if balls[my_ball_id].state.s == 4:
-                continue
-            
-            my_ball_pos = balls[my_ball_id].state.rvw[0]
-            
-            nearest_dist = float('inf')
-            target_rail = None
-            
-            for cushion_name, cushion_val in self.cushions.items():
-                if 'x' in cushion_name:
-                    dist = abs(my_ball_pos[0] - cushion_val)
-                    if dist < nearest_dist:
-                        nearest_dist = dist
-                        target_rail = [cushion_val, my_ball_pos[1]]
-                else:
-                    dist = abs(my_ball_pos[1] - cushion_val)
-                    if dist < nearest_dist:
-                        nearest_dist = dist
-                        target_rail = [my_ball_pos[0], cushion_val]
-            
-            if target_rail:
-                action = self._geo_shot(cue_pos, my_ball_pos, target_rail)
-                action['V0'] = 1.0
+                # 计算把球打到库边所需的撞击点
+                # 利用 _geo_shot 原理，把 rail_point 当作 pocket
+                action = self._geo_shot(cue_pos, my_ball_pos, target_point)
+                
+                # 力度控制：确保能碰到库
+                dist_cue_obj = self._calc_dist(cue_pos, my_ball_pos)
+                dist_obj_rail = self._calc_dist(my_ball_pos, target_point)
+                required_v = 1.0 + (dist_cue_obj + dist_obj_rail) * 1.5
+                action['V0'] = min(max(required_v, 1.5), 6.0) # 限制力度范围
+                
                 candidate_safeties.append(action)
-        
+
+        # --- 策略B: 薄切安全球 (Thin Cut Safety) ---
+        # 目标：薄切目标球，让白球快速分离并吃库/跑远
+        for my_ball_id in my_targets:
+            if balls[my_ball_id].state.s == 4: continue
+            target_pos = balls[my_ball_id].state.rvw[0]
+            
+            # 基础动作：对着球心打 (GhostBall=Target)
+            # 这里的 pocket_pos 参数用 target_pos 替代，_calc_ghost_ball 会返回 target_pos 本身
+            base_action = self._geo_shot(cue_pos, target_pos, target_pos) 
+            
+            for cut_angle in [-45, -30, 30, 45]:
+                action = copy.deepcopy(base_action)
+                action['phi'] = (action['phi'] + cut_angle) % 360
+                action['V0'] = 3.0 # 中等力度，让白球跑起来
+                candidate_safeties.append(action)
+
+        # --- 策略C: 贴库球轻贴 (Soft Touch) ---
+        # 仅当目标球已经在库边附近时，尝试轻推做死球
+        for my_ball_id in my_targets:
+            if balls[my_ball_id].state.s == 4: continue
+            my_ball_pos = balls[my_ball_id].state.rvw[0]
+            
+            min_rail_dist = min(
+                abs(my_ball_pos[0] - self.TABLE_WIDTH/2), abs(my_ball_pos[0] + self.TABLE_WIDTH/2),
+                abs(my_ball_pos[1] - self.TABLE_HEIGHT/2), abs(my_ball_pos[1] + self.TABLE_HEIGHT/2)
+            )
+            
+            if min_rail_dist < self.BALL_RADIUS * 2.0:
+                action = self._geo_shot(cue_pos, my_ball_pos, my_ball_pos)
+                action['V0'] = 0.5 + self._calc_dist(cue_pos, my_ball_pos) * 1.2
+                candidate_safeties.append(action)
+
         if not candidate_safeties:
             return self._safe_action()
         
-        # 评估所有防守方案
+        # 3. 评估防守方案
+        # 由于数量可能较多，随机打乱后评估前12个
+        random.shuffle(candidate_safeties)
+        print(f"[Agent] 生成 {len(candidate_safeties)} 个防守方案，筛选评估前 12 个...")
+        
         best_safety = None
         lowest_opp_score = float('inf')
         
-        for action in candidate_safeties:
+        for action in candidate_safeties[:12]:
             opp_score = self._evaluate_safety_shot(action, balls, my_targets, table)
             
-            if opp_score < lowest_opp_score:
+            # 有效防守 (没犯规 且 分数低)
+            if opp_score < 700 and opp_score < lowest_opp_score:
                 lowest_opp_score = opp_score
                 best_safety = action
+                # 如果把对手限制到负分，直接满意
+                if lowest_opp_score < -20: 
+                    break
         
+        if best_safety is None:
+             # 如果前面都犯规了，随便给一个推底库的方案
+             return candidate_safeties[0] if candidate_safeties else self._safe_action()
+
         print(f"[Agent] 防守方案选定 - 对手最佳回球估计: {lowest_opp_score:.1f}")
-        
         return best_safety
 
     # ============================================================================
